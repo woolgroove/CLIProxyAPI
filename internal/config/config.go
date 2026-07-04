@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPanelGitHubRepository = "https://github.com/josephcy95/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 	DefaultAuthDir               = "~/.cli-proxy-api"
 )
@@ -276,7 +276,19 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	IdentityConfuse bool                    `yaml:"identity-confuse" json:"identity-confuse"`
+	Instructions    CodexInstructionsConfig `yaml:"instructions" json:"instructions"`
+}
+
+// CodexInstructionsConfig configures additional instructions injected into the
+// final Codex Responses API instructions field.
+type CodexInstructionsConfig struct {
+	Enabled   bool     `yaml:"enabled" json:"enabled"`
+	Mode      string   `yaml:"mode" json:"mode"`
+	Content   string   `yaml:"content" json:"content"`
+	File      string   `yaml:"file" json:"file"`
+	Models    []string `yaml:"models" json:"models"`
+	OAuthOnly *bool    `yaml:"oauth-only,omitempty" json:"oauth-only,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.

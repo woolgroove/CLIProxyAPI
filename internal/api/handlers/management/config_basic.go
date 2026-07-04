@@ -255,6 +255,31 @@ func (h *Handler) PutWebsocketAuth(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.WebsocketAuth = v })
 }
 
+func (h *Handler) GetCodexInstructions(c *gin.Context) {
+	c.JSON(http.StatusOK, h.cfg.Codex.Instructions)
+}
+
+func (h *Handler) PutCodexInstructions(c *gin.Context) {
+	var body config.CodexInstructionsConfig
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body", "message": err.Error()})
+		return
+	}
+	body.Mode = strings.ToLower(strings.TrimSpace(body.Mode))
+	if body.Mode == "" {
+		body.Mode = "prepend"
+	}
+	if body.Mode != "prepend" && body.Mode != "append" && body.Mode != "replace" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid mode", "message": "mode must be prepend, append, or replace"})
+		return
+	}
+	for i := range body.Models {
+		body.Models[i] = strings.TrimSpace(body.Models[i])
+	}
+	h.cfg.Codex.Instructions = body
+	h.persist(c)
+}
+
 // Request retry
 func (h *Handler) GetRequestRetry(c *gin.Context) {
 	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})
