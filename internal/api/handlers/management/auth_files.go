@@ -541,6 +541,16 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["plan_checked_at"] = planCheckedAt
 		}
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+		if statusCode, cooldownUntil := xaiAuthStatus(auth, time.Now()); statusCode > 0 || !cooldownUntil.IsZero() {
+			if statusCode > 0 {
+				entry["xai_last_error_status"] = statusCode
+			}
+			if !cooldownUntil.IsZero() {
+				entry["xai_cooldown_until"] = cooldownUntil
+			}
+		}
+	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {
@@ -637,6 +647,36 @@ func authCodexPlanType(auth *coreauth.Auth) string {
 		}
 	}
 	return strings.TrimSpace(authAttribute(auth, "plan_type"))
+}
+
+func xaiAuthStatus(auth *coreauth.Auth, now time.Time) (int, time.Time) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+		return 0, time.Time{}
+	}
+
+	statusCode := 0
+	if auth.LastError != nil {
+		statusCode = auth.LastError.StatusCode()
+	}
+
+	cooldownUntil := auth.NextRetryAfter
+	if !cooldownUntil.After(now) {
+		cooldownUntil = time.Time{}
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if statusCode == 0 && state.LastError != nil {
+			statusCode = state.LastError.StatusCode()
+		}
+		if state.NextRetryAfter.After(now) &&
+			(cooldownUntil.IsZero() || state.NextRetryAfter.Before(cooldownUntil)) {
+			cooldownUntil = state.NextRetryAfter
+		}
+	}
+
+	return statusCode, cooldownUntil
 }
 
 func authMetadataString(auth *coreauth.Auth, key string) string {

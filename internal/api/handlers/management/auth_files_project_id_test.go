@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -144,6 +145,53 @@ func TestListAuthFiles_IncludesStoredCodexPlanType(t *testing.T) {
 	}
 	if got := entry["plan_checked_at"]; got != "2026-07-13T00:00:00Z" {
 		t.Fatalf("unexpected plan_checked_at %#v", got)
+	}
+}
+
+func TestListAuthFiles_ExposesXAIStatus(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	fileName := "xai-user.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"xai"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	cooldownUntil := time.Now().Add(30 * time.Minute).Round(0)
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "xai",
+		Status:   coreauth.StatusError,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		LastError: &coreauth.Error{HTTPStatus: http.StatusForbidden},
+		ModelStates: map[string]*coreauth.ModelState{
+			"grok-4.5": {
+				NextRetryAfter: cooldownUntil,
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	entry := firstAuthFileEntry(t, h)
+	if got := entry["xai_last_error_status"]; got != float64(http.StatusForbidden) {
+		t.Fatalf("expected xai_last_error_status %d, got %#v", http.StatusForbidden, got)
+	}
+	gotCooldown, ok := entry["xai_cooldown_until"].(string)
+	if !ok {
+		t.Fatalf("expected xai_cooldown_until string, got %#v", entry["xai_cooldown_until"])
+	}
+	if parsed, errParse := time.Parse(time.RFC3339Nano, gotCooldown); errParse != nil || !parsed.Equal(cooldownUntil) {
+		t.Fatalf("unexpected xai_cooldown_until %q: %v", gotCooldown, errParse)
 	}
 }
 
