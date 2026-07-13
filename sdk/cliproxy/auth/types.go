@@ -194,6 +194,10 @@ type ModelState struct {
 	FreeUsageExhaustionCount int `json:"free_usage_exhaustion_count,omitempty"`
 	// OtherForbiddenCount tracks repeated xAI other-403 hits (auth runtime).
 	OtherForbiddenCount int `json:"other_forbidden_count,omitempty"`
+	// UsageLimitCount tracks repeated Codex usage_limit_reached hits (auth runtime).
+	UsageLimitCount int `json:"usage_limit_count,omitempty"`
+	// AuthFailureCount tracks repeated Codex hard auth-death failures (auth runtime).
+	AuthFailureCount int `json:"auth_failure_count,omitempty"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
 }

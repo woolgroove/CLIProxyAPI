@@ -62,6 +62,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 	cfg.XAI = NormalizeXAIConfig(cfg.XAI)
+	cfg.Codex = NormalizeCodexConfig(cfg.Codex)
 
 	cfg.NormalizePluginsConfig()
 

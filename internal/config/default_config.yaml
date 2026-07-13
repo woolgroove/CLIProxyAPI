@@ -73,6 +73,10 @@ routing:
 
 codex:
   identity-confuse: false
+  auto-disable-auth-failures: true
+  auth-failure-disable-after: 1
+  usage-limit-disable-after: 3
+  usage-limit-cooldown-fallback-hours: 1
   instructions:
     enabled: false
     mode: "prepend"

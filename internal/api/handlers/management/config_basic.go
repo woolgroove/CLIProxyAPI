@@ -318,6 +318,42 @@ func (h *Handler) PutXAIConfig(c *gin.Context) {
 	h.persist(c)
 }
 
+func (h *Handler) GetCodexFailureConfig(c *gin.Context) {
+	normalized := config.NormalizeCodexConfig(h.cfg.Codex)
+	c.JSON(http.StatusOK, gin.H{
+		"auto-disable-auth-failures":           normalized.AutoDisableAuthFailures,
+		"auth-failure-disable-after":           normalized.AuthFailureDisableAfter,
+		"usage-limit-disable-after":            normalized.UsageLimitDisableAfter,
+		"usage-limit-cooldown-fallback-hours":  normalized.UsageLimitCooldownFallbackHours,
+	})
+}
+
+func (h *Handler) PutCodexFailureConfig(c *gin.Context) {
+	// Flat JSON keys from the management UI (Codex error-handling policy).
+	// Preserve identity-confuse / instructions when only failure knobs are sent.
+	var raw map[string]json.RawMessage
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body", "message": err.Error()})
+		return
+	}
+	rawBytes, errMarshal := json.Marshal(raw)
+	if errMarshal != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body", "message": errMarshal.Error()})
+		return
+	}
+	var body config.CodexConfig
+	if err := json.Unmarshal(rawBytes, &body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body", "message": err.Error()})
+		return
+	}
+	normalized := config.NormalizeCodexConfig(body)
+	h.cfg.Codex.AutoDisableAuthFailures = normalized.AutoDisableAuthFailures
+	h.cfg.Codex.AuthFailureDisableAfter = normalized.AuthFailureDisableAfter
+	h.cfg.Codex.UsageLimitDisableAfter = normalized.UsageLimitDisableAfter
+	h.cfg.Codex.UsageLimitCooldownFallbackHours = normalized.UsageLimitCooldownFallbackHours
+	h.persist(c)
+}
+
 // Request retry
 func (h *Handler) GetRequestRetry(c *gin.Context) {
 	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})

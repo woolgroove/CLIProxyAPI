@@ -23,17 +23,21 @@ const (
 //	      "http_status": 429,
 //	      "last_response": "...",
 //	      "free_usage_hits": 1,
-//	      "other_403_hits": 0
+//	      "other_403_hits": 0,
+//	      "usage_limit_hits": 0,
+//	      "auth_failure_hits": 0
 //	    }
 //	  }
 //	}
 type authRuntimeModelState struct {
-	CooldownUntil  time.Time `json:"cooldown_until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	HTTPStatus    int       `json:"http_status,omitempty"`
-	LastResponse  string    `json:"last_response,omitempty"`
-	FreeUsageHits int       `json:"free_usage_hits,omitempty"`
-	Other403Hits  int       `json:"other_403_hits,omitempty"`
+	CooldownUntil    time.Time `json:"cooldown_until,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
+	HTTPStatus      int       `json:"http_status,omitempty"`
+	LastResponse    string    `json:"last_response,omitempty"`
+	FreeUsageHits   int       `json:"free_usage_hits,omitempty"`
+	Other403Hits    int       `json:"other_403_hits,omitempty"`
+	UsageLimitHits  int       `json:"usage_limit_hits,omitempty"`
+	AuthFailureHits int       `json:"auth_failure_hits,omitempty"`
 }
 
 // hydrateAuthRuntimeFromMetadata rebuilds in-memory ModelStates from auth-file runtime.
@@ -76,7 +80,8 @@ func hydrateAuthRuntimeFromMetadata(auth *Auth, now time.Time) {
 		}
 		entry := parseAuthRuntimeModelState(entryMap)
 		cooling := !entry.CooldownUntil.IsZero() && entry.CooldownUntil.After(now)
-		if !cooling && entry.FreeUsageHits <= 0 && entry.Other403Hits <= 0 {
+		if !cooling && entry.FreeUsageHits <= 0 && entry.Other403Hits <= 0 &&
+			entry.UsageLimitHits <= 0 && entry.AuthFailureHits <= 0 {
 			continue
 		}
 		state := ensureModelState(auth, model)
@@ -111,6 +116,12 @@ func hydrateAuthRuntimeFromMetadata(auth *Auth, now time.Time) {
 		}
 		if entry.Other403Hits > state.OtherForbiddenCount {
 			state.OtherForbiddenCount = entry.Other403Hits
+		}
+		if entry.UsageLimitHits > state.UsageLimitCount {
+			state.UsageLimitCount = entry.UsageLimitHits
+		}
+		if entry.AuthFailureHits > state.AuthFailureCount {
+			state.AuthFailureCount = entry.AuthFailureHits
 		}
 		state.UpdatedAt = now
 	}
@@ -164,12 +175,15 @@ func modelStateToRuntimeEntry(state *ModelState, now time.Time) *authRuntimeMode
 		return nil
 	}
 	cooling := state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now)
-	if !cooling && state.FreeUsageExhaustionCount <= 0 && state.OtherForbiddenCount <= 0 {
+	if !cooling && state.FreeUsageExhaustionCount <= 0 && state.OtherForbiddenCount <= 0 &&
+		state.UsageLimitCount <= 0 && state.AuthFailureCount <= 0 {
 		return nil
 	}
 	entry := &authRuntimeModelState{
-		FreeUsageHits: state.FreeUsageExhaustionCount,
-		Other403Hits:  state.OtherForbiddenCount,
+		FreeUsageHits:   state.FreeUsageExhaustionCount,
+		Other403Hits:    state.OtherForbiddenCount,
+		UsageLimitHits:  state.UsageLimitCount,
+		AuthFailureHits: state.AuthFailureCount,
 	}
 	if cooling {
 		entry.CooldownUntil = state.NextRetryAfter
@@ -211,6 +225,12 @@ func runtimeEntryToMap(entry *authRuntimeModelState) map[string]any {
 	if entry.Other403Hits > 0 {
 		out["other_403_hits"] = entry.Other403Hits
 	}
+	if entry.UsageLimitHits > 0 {
+		out["usage_limit_hits"] = entry.UsageLimitHits
+	}
+	if entry.AuthFailureHits > 0 {
+		out["auth_failure_hits"] = entry.AuthFailureHits
+	}
 	return out
 }
 
@@ -225,6 +245,8 @@ func parseAuthRuntimeModelState(m map[string]any) authRuntimeModelState {
 	entry.LastResponse = strings.TrimSpace(anyToString(m["last_response"]))
 	entry.FreeUsageHits = anyToInt(m["free_usage_hits"])
 	entry.Other403Hits = anyToInt(m["other_403_hits"])
+	entry.UsageLimitHits = anyToInt(m["usage_limit_hits"])
+	entry.AuthFailureHits = anyToInt(m["auth_failure_hits"])
 	return entry
 }
 

@@ -3495,15 +3495,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else if m.shouldAutoDisableXAIAuth(result) {
 			m.disableXAIAuthForPermissionFailure(auth, result.Error, now)
 		} else {
-			// Count free-usage / other-403 hits before applying cooldown so the first
-			// exhaustion also increments; subsequent hits only count after cooldown ends.
+			// Count exhaustion hits before applying cooldown so the first event also
+			// increments; subsequent hits only count after cooldown ends.
 			// A successful request after cooldown resets counters via resetModelState.
 			disabledByExhaustion := false
 			if kind := m.xaiExhaustionKindForResult(result); kind != "" {
 				disabledByExhaustion = m.trackXAIExhaustionCounter(auth, result, kind, now)
 			}
+			if !disabledByExhaustion {
+				if kind := m.codexExhaustionKindForResult(result); kind != "" {
+					disabledByExhaustion = m.trackCodexExhaustionCounter(auth, result, kind, now)
+				}
+			}
 			if disabledByExhaustion {
-				// Auth was disabled for repeated free-usage / other-403 exhaustion.
+				// Auth was disabled for repeated exhaustion / auth-death.
 			} else if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
 					disableCooling := m.cooldownDisabledForAuth(auth)
@@ -3518,13 +3523,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						auth.StatusMessage = result.Error.Message
 					}
 
-					// Prefer provider RetryAfter; for known xAI exhaustion codes, fall back to
-					// configured long cooldowns so a missing RetryAfter (mid-stream path) does
-					// not collapse to the 1s quota backoff ladder.
+					// Prefer provider RetryAfter; for known xAI/Codex exhaustion codes, fall back
+					// to configured long cooldowns so a missing RetryAfter does not collapse to
+					// the 1s quota backoff ladder.
 					effectiveRetryAfter := m.effectiveRetryAfterForResult(result)
 					statusCode := statusCodeFromResult(result.Error)
 					if statusCode == 0 && isXAIFreeUsageExhaustedErrorMessage(result.Error) {
 						// Body looks like free-usage exhaustion but status was lost; treat as 429.
+						statusCode = http.StatusTooManyRequests
+						if result.Error != nil {
+							result.Error.HTTPStatus = http.StatusTooManyRequests
+						}
+					}
+					if statusCode == 0 && isCodexUsageLimitErrorMessage(result.Error) {
 						statusCode = http.StatusTooManyRequests
 						if result.Error != nil {
 							result.Error.HTTPStatus = http.StatusTooManyRequests
@@ -3741,27 +3752,44 @@ func isXAIFreeUsageExhaustedErrorMessage(resultErr *Error) bool {
 }
 
 // effectiveRetryAfterForResult returns the provider RetryAfter when present; otherwise, for
-// known xAI free-usage / other-403 failures, the configured long cooldown duration.
+// known xAI free-usage / other-403 or Codex usage-limit failures, the configured fallback.
 func (m *Manager) effectiveRetryAfterForResult(result Result) *time.Duration {
 	if result.RetryAfter != nil {
 		value := *result.RetryAfter
 		return &value
 	}
-	if m == nil || !strings.EqualFold(strings.TrimSpace(result.Provider), "xai") || result.Error == nil {
+	if m == nil || result.Error == nil {
 		return nil
 	}
+	provider := strings.ToLower(strings.TrimSpace(result.Provider))
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	policy := internalconfig.DefaultXAIConfig()
-	if cfg != nil {
-		policy = internalconfig.NormalizeXAIConfig(cfg.XAI)
-	}
-	if isXAIFreeUsageExhaustedError(result.Error) || isXAIFreeUsageExhaustedErrorMessage(result.Error) {
-		d := time.Duration(policy.FreeUsageExhaustedCooldownHoursValue()) * time.Hour
-		return &d
-	}
-	if result.Error.HTTPStatus == http.StatusForbidden && !isXAIPermissionDeniedError(result.Error) {
-		d := time.Duration(policy.OtherForbiddenCooldownHoursValue()) * time.Hour
-		return &d
+	switch provider {
+	case "xai":
+		policy := internalconfig.DefaultXAIConfig()
+		if cfg != nil {
+			policy = internalconfig.NormalizeXAIConfig(cfg.XAI)
+		}
+		if isXAIFreeUsageExhaustedError(result.Error) || isXAIFreeUsageExhaustedErrorMessage(result.Error) {
+			d := time.Duration(policy.FreeUsageExhaustedCooldownHoursValue()) * time.Hour
+			return &d
+		}
+		if result.Error.HTTPStatus == http.StatusForbidden && !isXAIPermissionDeniedError(result.Error) {
+			d := time.Duration(policy.OtherForbiddenCooldownHoursValue()) * time.Hour
+			return &d
+		}
+	case "codex":
+		policy := internalconfig.DefaultCodexFailurePolicy()
+		if cfg != nil {
+			policy = internalconfig.NormalizeCodexConfig(cfg.Codex)
+		}
+		if isCodexUsageLimitError(result.Error) || isCodexUsageLimitErrorMessage(result.Error) {
+			hours := policy.UsageLimitCooldownFallbackHoursValue()
+			if hours <= 0 {
+				return nil
+			}
+			d := time.Duration(hours) * time.Hour
+			return &d
+		}
 	}
 	return nil
 }
@@ -3793,6 +3821,170 @@ func isXAIPermissionDeniedError(resultErr *Error) bool {
 	}
 	return strings.EqualFold(strings.TrimSpace(nestedError.Code), "permission-denied") ||
 		strings.EqualFold(strings.TrimSpace(nestedError.Message), "access denied.")
+}
+
+// codexExhaustionKind identifies Codex failures that can disable an auth after N hits.
+type codexExhaustionKind string
+
+const (
+	codexExhaustionUsageLimit  codexExhaustionKind = "usage_limit"
+	codexExhaustionAuthFailure codexExhaustionKind = "auth_failure"
+)
+
+func (m *Manager) codexExhaustionKindForResult(result Result) codexExhaustionKind {
+	if m == nil || !strings.EqualFold(strings.TrimSpace(result.Provider), "codex") || result.Error == nil {
+		return ""
+	}
+	if isCodexUsageLimitError(result.Error) || isCodexUsageLimitErrorMessage(result.Error) {
+		return codexExhaustionUsageLimit
+	}
+	if isCodexHardAuthFailureError(result.Error) {
+		return codexExhaustionAuthFailure
+	}
+	return ""
+}
+
+func isCodexUsageLimitError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	// usage_limit_reached is often remapped to 429; accept body match when status is 0/429/400.
+	status := resultErr.HTTPStatus
+	if status != 0 && status != http.StatusTooManyRequests && status != http.StatusBadRequest {
+		return false
+	}
+	return isCodexUsageLimitErrorMessage(resultErr)
+}
+
+func isCodexUsageLimitErrorMessage(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	body := strings.ToLower(resultErr.Message + " " + resultErr.Code)
+	return strings.Contains(body, "usage_limit_reached") ||
+		strings.Contains(body, "you've hit your usage limit") ||
+		strings.Contains(body, "hit your usage limit")
+}
+
+func isCodexHardAuthFailureError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	if isInvalidGrantResultError(resultErr) {
+		return true
+	}
+	body := strings.ToLower(resultErr.Message + " " + resultErr.Code)
+	if strings.Contains(body, "auth_unavailable") ||
+		strings.Contains(body, "authentication_error") ||
+		strings.Contains(body, "invalid_api_key") ||
+		strings.Contains(body, "invalid or expired token") ||
+		strings.Contains(body, "refresh_token_reused") ||
+		strings.Contains(body, "token has been expired or revoked") ||
+		strings.Contains(body, "access token invalidated") ||
+		strings.Contains(body, "needs re-auth") ||
+		strings.Contains(body, "reauthorize") ||
+		strings.Contains(body, "re-authenticate") {
+		return true
+	}
+	status := resultErr.HTTPStatus
+	if status == http.StatusUnauthorized {
+		// 401 without request-scoped noise is treated as auth death for Codex OAuth pools.
+		if isRequestScopedNotFoundResultError(resultErr) || isModelSupportResultError(resultErr) {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+// trackCodexExhaustionCounter increments usage-limit / auth-failure counters and may disable
+// the auth file. Returns true when the auth was disabled.
+func (m *Manager) trackCodexExhaustionCounter(auth *Auth, result Result, kind codexExhaustionKind, now time.Time) bool {
+	if m == nil || auth == nil || kind == "" {
+		return false
+	}
+	// Auth-failure disable can run without a model name (file-level death).
+	if kind == codexExhaustionUsageLimit && strings.TrimSpace(result.Model) == "" {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return false
+	}
+
+	threshold := 0
+	switch kind {
+	case codexExhaustionUsageLimit:
+		threshold = cfg.Codex.UsageLimitDisableAfterValue()
+	case codexExhaustionAuthFailure:
+		threshold = cfg.Codex.AuthFailureDisableAfterValue()
+	default:
+		return false
+	}
+	if threshold <= 0 {
+		return false
+	}
+
+	model := strings.TrimSpace(result.Model)
+	if model == "" {
+		// File-level auth death: use a synthetic model key only for counter storage.
+		model = "_auth"
+	}
+	state := ensureModelState(auth, model)
+	// Do not double-count while the model is still inside an active cooldown window.
+	if state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+		return false
+	}
+
+	switch kind {
+	case codexExhaustionUsageLimit:
+		state.UsageLimitCount++
+		if state.UsageLimitCount >= threshold {
+			reason := fmt.Sprintf(
+				"Codex usage limit always exhausted (counter=%d, threshold=%d)",
+				state.UsageLimitCount,
+				threshold,
+			)
+			m.disableCodexAuth(auth, reason, result.Error, now)
+			return true
+		}
+	case codexExhaustionAuthFailure:
+		state.AuthFailureCount++
+		if state.AuthFailureCount >= threshold {
+			reason := fmt.Sprintf(
+				"Codex auth failure (counter=%d, threshold=%d)",
+				state.AuthFailureCount,
+				threshold,
+			)
+			if result.Error != nil && strings.TrimSpace(result.Error.Message) != "" {
+				// Prefer the upstream body as disabled_reason when present.
+				reason = result.Error.Message
+			}
+			m.disableCodexAuth(auth, reason, result.Error, now)
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) disableCodexAuth(auth *Auth, reason string, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "Codex auth disabled"
+	}
+	auth.Disabled = true
+	auth.Status = StatusDisabled
+	auth.StatusMessage = reason
+	auth.UpdatedAt = now
+	auth.LastError = cloneError(resultErr)
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = true
+	auth.Metadata["disabled_reason"] = reason
 }
 
 // trackXAIExhaustionCounter increments post-cooldown exhaustion counters on the auth file
@@ -3879,6 +4071,8 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.Quota = QuotaState{}
 	state.FreeUsageExhaustionCount = 0
 	state.OtherForbiddenCount = 0
+	state.UsageLimitCount = 0
+	state.AuthFailureCount = 0
 	state.UpdatedAt = now
 }
 

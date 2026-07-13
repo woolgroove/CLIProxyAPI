@@ -893,6 +893,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/xai-config", s.mgmt.GetXAIConfig)
 		mgmt.PUT("/xai-config", s.mgmt.PutXAIConfig)
 		mgmt.PATCH("/xai-config", s.mgmt.PutXAIConfig)
+		mgmt.GET("/codex-failure-config", s.mgmt.GetCodexFailureConfig)
+		mgmt.PUT("/codex-failure-config", s.mgmt.PutCodexFailureConfig)
+		mgmt.PATCH("/codex-failure-config", s.mgmt.PutCodexFailureConfig)
 
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)

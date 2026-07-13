@@ -278,10 +278,90 @@ type CodexHeaderDefaults struct {
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
 }
 
-// CodexConfig configures provider-wide Codex request behavior.
+// CodexConfig configures provider-wide Codex request behavior and failure policy.
 type CodexConfig struct {
-	IdentityConfuse bool                    `yaml:"identity-confuse" json:"identity-confuse"`
-	Instructions    CodexInstructionsConfig `yaml:"instructions" json:"instructions"`
+	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// AutoDisableAuthFailures permanently disables an auth file after confirmed
+	// auth-death failures (invalid token, invalid_grant, failed re-auth, etc.).
+	AutoDisableAuthFailures *bool `yaml:"auto-disable-auth-failures,omitempty" json:"auto-disable-auth-failures,omitempty"`
+	// AuthFailureDisableAfter is how many hard auth failures disable the auth file.
+	// Counted after cooldown ends (first hit counts). 0 disables auto-disable for this path.
+	AuthFailureDisableAfter *int `yaml:"auth-failure-disable-after,omitempty" json:"auth-failure-disable-after,omitempty"`
+	// UsageLimitDisableAfter disables the auth file after this many usage_limit_reached
+	// events (first hit + post-cooldown re-hits). Persisted in auth-file runtime. 0 disables.
+	UsageLimitDisableAfter *int `yaml:"usage-limit-disable-after,omitempty" json:"usage-limit-disable-after,omitempty"`
+	// UsageLimitCooldownFallbackHours is used when usage_limit_reached has no resets_at /
+	// resets_in_seconds. Set 0 to keep the short progressive quota backoff only.
+	UsageLimitCooldownFallbackHours *int `yaml:"usage-limit-cooldown-fallback-hours,omitempty" json:"usage-limit-cooldown-fallback-hours,omitempty"`
+	Instructions                    CodexInstructionsConfig `yaml:"instructions" json:"instructions"`
+}
+
+// DefaultCodexFailurePolicy returns Codex credential failure defaults when keys are omitted.
+func DefaultCodexFailurePolicy() CodexConfig {
+	autoDisable := true
+	authFailureAfter := 1
+	usageLimitAfter := 3
+	usageLimitFallbackHours := 1
+	return CodexConfig{
+		AutoDisableAuthFailures:         &autoDisable,
+		AuthFailureDisableAfter:         &authFailureAfter,
+		UsageLimitDisableAfter:          &usageLimitAfter,
+		UsageLimitCooldownFallbackHours: &usageLimitFallbackHours,
+	}
+}
+
+// NormalizeCodexConfig fills omitted Codex failure-policy values and clamps negatives.
+func NormalizeCodexConfig(value CodexConfig) CodexConfig {
+	defaults := DefaultCodexFailurePolicy()
+	if value.AutoDisableAuthFailures == nil {
+		value.AutoDisableAuthFailures = defaults.AutoDisableAuthFailures
+	}
+	if value.AuthFailureDisableAfter == nil {
+		value.AuthFailureDisableAfter = defaults.AuthFailureDisableAfter
+	} else if *value.AuthFailureDisableAfter < 0 {
+		zero := 0
+		value.AuthFailureDisableAfter = &zero
+	}
+	if value.UsageLimitDisableAfter == nil {
+		value.UsageLimitDisableAfter = defaults.UsageLimitDisableAfter
+	} else if *value.UsageLimitDisableAfter < 0 {
+		zero := 0
+		value.UsageLimitDisableAfter = &zero
+	}
+	if value.UsageLimitCooldownFallbackHours == nil {
+		value.UsageLimitCooldownFallbackHours = defaults.UsageLimitCooldownFallbackHours
+	} else if *value.UsageLimitCooldownFallbackHours < 0 {
+		zero := 0
+		value.UsageLimitCooldownFallbackHours = &zero
+	}
+	return value
+}
+
+// AutoDisableAuthFailuresEnabled reports whether hard Codex auth failures may disable files.
+func (value CodexConfig) AutoDisableAuthFailuresEnabled() bool {
+	normalized := NormalizeCodexConfig(value)
+	return normalized.AutoDisableAuthFailures != nil && *normalized.AutoDisableAuthFailures
+}
+
+// AuthFailureDisableAfterValue returns how many hard auth failures disable the auth file.
+func (value CodexConfig) AuthFailureDisableAfterValue() int {
+	normalized := NormalizeCodexConfig(value)
+	if !normalized.AutoDisableAuthFailuresEnabled() {
+		return 0
+	}
+	return *normalized.AuthFailureDisableAfter
+}
+
+// UsageLimitDisableAfterValue returns how many usage-limit re-hits disable the auth file.
+func (value CodexConfig) UsageLimitDisableAfterValue() int {
+	normalized := NormalizeCodexConfig(value)
+	return *normalized.UsageLimitDisableAfter
+}
+
+// UsageLimitCooldownFallbackHoursValue returns the fallback cool when reset fields are absent.
+func (value CodexConfig) UsageLimitCooldownFallbackHoursValue() int {
+	normalized := NormalizeCodexConfig(value)
+	return *normalized.UsageLimitCooldownFallbackHours
 }
 
 // XAIConfig configures xAI/Grok credential failure handling.
@@ -943,6 +1023,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 	cfg.XAI = NormalizeXAIConfig(cfg.XAI)
+	cfg.Codex = NormalizeCodexConfig(cfg.Codex)
 
 	cfg.NormalizePluginsConfig()
 

@@ -196,6 +196,17 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # Disable an auth file after confirmed auth-death failures (invalid token, invalid_grant,
+  # auth_unavailable after re-auth is required). First hit counts; set disable-after 0 (or
+  # turn this off) to only cool without permanent disable. Reason is stored as disabled_reason.
+  auto-disable-auth-failures: true
+  auth-failure-disable-after: 1
+  # After this many usage_limit_reached events (first hit + post-cooldown re-hits), disable the
+  # auth file. Counters persist in the auth JSON runtime block. Set 0 to never auto-disable.
+  # Cooldown prefers upstream resets_at / resets_in_seconds; fallback hours apply only when
+  # those fields are missing. Transient rate_limit_error is not counted here.
+  usage-limit-disable-after: 3
+  usage-limit-cooldown-fallback-hours: 1
   # Optional private instruction injection for Codex OAuth requests.
   # This edits the final upstream Codex Responses API `instructions` field after
   # CPA has built its Codex CLI prompt, so `prepend` keeps the built-in Codex behavior.
