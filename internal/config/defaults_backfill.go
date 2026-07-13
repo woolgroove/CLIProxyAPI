@@ -29,7 +29,6 @@ func applyBuiltinPreUnmarshalDefaults(cfg *Config) {
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
-	cfg.SaveCooldownStatus = true
 	cfg.TransientErrorCooldownSeconds = 0
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.XAI = DefaultXAIConfig()
@@ -86,6 +85,9 @@ func ensureMissingConfigKeysOnDisk(configFile string, data []byte) (bool, error)
 	}
 
 	changed := backfillMissingMappingKeys(original.Content[0], defaultsDoc.Content[0], nil)
+	if pruneObsoleteTopLevelConfigKeys(original.Content[0]) {
+		changed = true
+	}
 	if !changed {
 		return false, nil
 	}
@@ -172,4 +174,34 @@ func shouldSkipDefaultBackfillPath(path []string) bool {
 		return true
 	}
 	return false
+}
+
+// obsoleteTopLevelConfigKeys are keys that used to exist in config.yaml but are no longer
+// part of the product. On load/backfill we remove them so the on-disk file stays relevant.
+var obsoleteTopLevelConfigKeys = map[string]struct{}{
+	"save-cooldown-status": {},
+}
+
+// pruneObsoleteTopLevelConfigKeys removes deprecated root-level keys from a YAML mapping node.
+// Returns true when the document was modified.
+func pruneObsoleteTopLevelConfigKeys(root *yaml.Node) bool {
+	if root == nil || root.Kind != yaml.MappingNode {
+		return false
+	}
+	changed := false
+	for i := 0; i+1 < len(root.Content); {
+		keyNode := root.Content[i]
+		if keyNode == nil {
+			i += 2
+			continue
+		}
+		key := strings.TrimSpace(keyNode.Value)
+		if _, obsolete := obsoleteTopLevelConfigKeys[key]; !obsolete {
+			i += 2
+			continue
+		}
+		root.Content = append(root.Content[:i], root.Content[i+2:]...)
+		changed = true
+	}
+	return changed
 }

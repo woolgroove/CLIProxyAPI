@@ -767,37 +767,6 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	coreauth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 }
 
-func (s *Service) configureCooldownStateStore(cfg *config.Config) {
-	if s == nil || s.coreManager == nil {
-		return
-	}
-	if cfg == nil || !cfg.SaveCooldownStatus || cfg.Home.Enabled {
-		s.coreManager.SetCooldownStateStore(nil)
-		return
-	}
-	authDir, errResolve := resolveCooldownStateAuthDir(cfg)
-	if errResolve != nil {
-		log.Warnf("failed to resolve cooldown state directory: %v", errResolve)
-		s.coreManager.SetCooldownStateStore(nil)
-		return
-	}
-	if authDir == "" {
-		s.coreManager.SetCooldownStateStore(nil)
-		return
-	}
-	s.coreManager.SetCooldownStateStore(coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir))
-}
-
-func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {
-	if cfg == nil {
-		return "", nil
-	}
-	authDir, errAuthDir := util.ResolveAuthDir(cfg.AuthDir)
-	if errAuthDir != nil {
-		return "", errAuthDir
-	}
-	return authDir, nil
-}
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
@@ -1321,7 +1290,6 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	}
 
 	s.applyRetryConfig(newCfg)
-	s.configureCooldownStateStore(newCfg)
 	s.applyPprofConfig(newCfg)
 	if s.server != nil {
 		s.server.UpdateClients(newCfg)
@@ -1346,11 +1314,6 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	})
 	if synthesizeConfigAuths {
 		s.registerConfigAPIKeyAuths(ctx, newCfg)
-	}
-	if s.coreManager != nil && !newCfg.Home.Enabled && newCfg.SaveCooldownStatus {
-		if errRestoreCooldown := s.coreManager.RestoreCooldownStates(context.Background()); errRestoreCooldown != nil {
-			log.Warnf("failed to restore cooldown state after config update: %v", errRestoreCooldown)
-		}
 	}
 	s.syncPluginModelRuntime(ctx)
 }
@@ -1414,7 +1377,6 @@ func forceHomeRuntimeConfig(cfg *config.Config) {
 	cfg.APIKeys = nil
 	cfg.UsageStatisticsEnabled = true
 	cfg.DisableCooling = true
-	cfg.SaveCooldownStatus = false
 	cfg.WebsocketAuth = false
 	cfg.RemoteManagement.AllowRemote = false
 	cfg.RemoteManagement.DisableControlPanel = true
@@ -1636,7 +1598,6 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.applyRetryConfig(s.cfg)
-	s.configureCooldownStateStore(s.cfg)
 
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {
@@ -1644,11 +1605,6 @@ func (s *Service) Run(ctx context.Context) error {
 			log.Warnf("failed to load auth store: %v", errLoad)
 		}
 		s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), s.cfg)
-		if s.cfg.SaveCooldownStatus {
-			if errRestoreCooldown := s.coreManager.RestoreCooldownStates(ctx); errRestoreCooldown != nil {
-				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
-			}
-		}
 	}
 
 	if !homeEnabled {

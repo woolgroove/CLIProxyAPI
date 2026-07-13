@@ -289,7 +289,6 @@ func (h *Handler) PutCodexInstructions(c *gin.Context) {
 func (h *Handler) GetXAIConfig(c *gin.Context) {
 	normalized := config.NormalizeXAIConfig(h.cfg.XAI)
 	c.JSON(http.StatusOK, gin.H{
-		"save-cooldown-status":                h.cfg.SaveCooldownStatus,
 		"auto-disable-permission-denied":      normalized.AutoDisablePermissionDenied,
 		"other-403-cooldown-hours":            normalized.OtherForbiddenCooldownHours,
 		"free-usage-exhausted-cooldown-hours": normalized.FreeUsageExhaustedCooldownHours,
@@ -299,7 +298,7 @@ func (h *Handler) GetXAIConfig(c *gin.Context) {
 }
 
 func (h *Handler) PutXAIConfig(c *gin.Context) {
-	// Flat JSON keys from the management UI (xAI policy + optional save-cooldown-status).
+	// Flat JSON keys from the management UI (xAI failure policy).
 	var raw map[string]json.RawMessage
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body", "message": err.Error()})
@@ -316,14 +315,6 @@ func (h *Handler) PutXAIConfig(c *gin.Context) {
 		return
 	}
 	h.cfg.XAI = config.NormalizeXAIConfig(xaiBody)
-	if rawValue, ok := raw["save-cooldown-status"]; ok {
-		var saveCooldown bool
-		if err := json.Unmarshal(rawValue, &saveCooldown); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid save-cooldown-status", "message": err.Error()})
-			return
-		}
-		h.cfg.SaveCooldownStatus = saveCooldown
-	}
 	h.persist(c)
 }
 

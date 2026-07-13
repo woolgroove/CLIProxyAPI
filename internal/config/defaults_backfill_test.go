@@ -43,9 +43,6 @@ func TestLoadConfigOptional_BackfillsMissingKeysFromDefaults(t *testing.T) {
 		t.Fatalf("api-keys = %#v, want [my-real-key]", cfg.APIKeys)
 	}
 
-	if !cfg.SaveCooldownStatus {
-		t.Fatal("expected SaveCooldownStatus=true after backfill")
-	}
 	if cfg.MaxRetryInterval != 30 {
 		t.Fatalf("max-retry-interval = %d, want 30", cfg.MaxRetryInterval)
 	}
@@ -68,7 +65,6 @@ func TestLoadConfigOptional_BackfillsMissingKeysFromDefaults(t *testing.T) {
 	}
 	text := string(data)
 	for _, key := range []string{
-		"save-cooldown-status:",
 		"max-retry-interval:",
 		"disable-cooling:",
 		"quota-exceeded:",
@@ -93,7 +89,6 @@ func TestLoadConfigOptional_ExplicitFalsePreserved(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	content := "" +
 		"port: 8317\n" +
-		"save-cooldown-status: false\n" +
 		"ws-auth: false\n" +
 		"request-retry: 0\n"
 	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
@@ -103,9 +98,6 @@ func TestLoadConfigOptional_ExplicitFalsePreserved(t *testing.T) {
 	cfg, err := LoadConfigOptional(configPath, false)
 	if err != nil {
 		t.Fatalf("LoadConfigOptional() error = %v", err)
-	}
-	if cfg.SaveCooldownStatus {
-		t.Fatal("explicit save-cooldown-status:false must be preserved")
 	}
 	if cfg.WebsocketAuth {
 		t.Fatal("explicit ws-auth:false must be preserved")
@@ -119,9 +111,6 @@ func TestParseConfigBytes_UsesBuiltinDefaults(t *testing.T) {
 	cfg, err := ParseConfigBytes([]byte("port: 8317\n"))
 	if err != nil {
 		t.Fatalf("ParseConfigBytes() error = %v", err)
-	}
-	if !cfg.SaveCooldownStatus {
-		t.Fatal("expected SaveCooldownStatus=true default")
 	}
 	if cfg.RequestRetry != 3 {
 		t.Fatalf("request-retry = %d, want 3", cfg.RequestRetry)
@@ -195,7 +184,10 @@ func TestLoadConfigOptional_OptionalCloudDoesNotWrite(t *testing.T) {
 		t.Fatalf("optional/cloud load must not rewrite config file")
 	}
 	// In-memory defaults still apply.
-	if !cfg.SaveCooldownStatus {
-		t.Fatal("expected in-memory SaveCooldownStatus default true")
+	if cfg == nil {
+		t.Fatal("expected config")
+	}
+	if cfg.Port != 8317 {
+		t.Fatalf("port = %d, want 8317", cfg.Port)
 	}
 }

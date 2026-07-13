@@ -120,9 +120,7 @@ func TestManagerMarkResult_FreeUsageExhaustionDisablesAfterThreshold(t *testing.
 	disableAfter := 3
 	freeCooldownHours := 24
 	manager := NewManager(nil, nil, nil)
-	manager.SetCooldownStateStore(&recordingCooldownStateStore{})
 	manager.SetConfig(&internalconfig.Config{
-		SaveCooldownStatus: true,
 		XAI: internalconfig.XAIConfig{
 			AutoDisablePermissionDenied:     &autoDisable,
 			FreeUsageExhaustedCooldownHours: &freeCooldownHours,
@@ -294,9 +292,7 @@ func TestManagerMarkResult_FreeUsageBodyWithoutStatusStillCooldowns(t *testing.T
 func TestManagerMarkResult_FreeUsageSuccessResetsCounter(t *testing.T) {
 	disableAfter := 3
 	manager := NewManager(nil, nil, nil)
-	manager.SetCooldownStateStore(&recordingCooldownStateStore{})
 	manager.SetConfig(&internalconfig.Config{
-		SaveCooldownStatus: true,
 		XAI: internalconfig.XAIConfig{
 			FreeUsageExhaustedDisableAfter: &disableAfter,
 		},
@@ -330,9 +326,7 @@ func TestManagerMarkResult_Other403ExhaustionDisablesAfterThreshold(t *testing.T
 	disableAfter := 2
 	otherCooldownHours := 6
 	manager := NewManager(nil, nil, nil)
-	manager.SetCooldownStateStore(&recordingCooldownStateStore{})
 	manager.SetConfig(&internalconfig.Config{
-		SaveCooldownStatus: true,
 		XAI: internalconfig.XAIConfig{
 			AutoDisablePermissionDenied: &autoDisable,
 			OtherForbiddenCooldownHours: &otherCooldownHours,
@@ -369,61 +363,120 @@ func TestManagerMarkResult_Other403ExhaustionDisablesAfterThreshold(t *testing.T
 	}
 }
 
-func TestManagerMarkResult_ExhaustionCounterRequiresCooldownStore(t *testing.T) {
+func TestManagerMarkResult_ExhaustionCounterRunsWithoutSeparateStore(t *testing.T) {
+	// Counters always run; runtime is written into auth.Metadata on persist.
 	disableAfter := 1
 	manager := NewManager(nil, nil, nil)
-	// No cooldown store → counters must not run (requires save-cooldown-status / .cds).
 	manager.SetConfig(&internalconfig.Config{
 		XAI: internalconfig.XAIConfig{
 			FreeUsageExhaustedDisableAfter: &disableAfter,
 		},
 	})
 
-	auth := &Auth{ID: "xai-no-cds", Provider: "xai"}
+	auth := &Auth{ID: "xai-auth-runtime", Provider: "xai", Metadata: map[string]any{"type": "xai"}}
 	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
 	manager.MarkResult(context.Background(), freeUsageExhaustedResult(auth.ID, "grok-4.5", time.Hour))
 	updated, _ := manager.GetByID(auth.ID)
-	if updated.Disabled {
-		t.Fatal("without cooldown store, free-usage must not disable auth via exhaustion counter")
+	if !updated.Disabled {
+		t.Fatal("with disable-after=1, free-usage should disable auth on first hit")
 	}
-	state := updated.ModelStates["grok-4.5"]
-	if state != nil && state.FreeUsageExhaustionCount != 0 {
-		t.Fatalf("counter without store = %d, want 0", state.FreeUsageExhaustionCount)
+	reason, _ := updated.Metadata["disabled_reason"].(string)
+	if !strings.Contains(reason, "always exhausted") {
+		t.Fatalf("disabled_reason = %q", reason)
 	}
 }
 
-func TestManager_RestoreCooldownStates_RestoresExhaustionCounters(t *testing.T) {
-	store := &recordingCooldownStateStore{
-		load: []CooldownStateRecord{
-			{
-				Provider:                 "xai",
-				AuthID:                   "auth-1",
-				Model:                    "grok-4",
-				Status:                   "tracked",
-				FreeUsageExhaustionCount: 2,
-				UpdatedAt:                time.Now().UTC(),
+func TestHydrateAuthRuntimeFromMetadata_RestoresCooldownAndCounters(t *testing.T) {
+	until := time.Now().Add(2 * time.Hour).UTC()
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "xai",
+		Metadata: map[string]any{
+			"type": "xai",
+			"runtime": map[string]any{
+				"models": map[string]any{
+					"grok-4": map[string]any{
+						"cooldown_until":  until.Format(time.RFC3339Nano),
+						"reason":          "free_usage_exhausted",
+						"http_status":     429,
+						"last_response":   "free usage exhausted",
+						"free_usage_hits": 2,
+					},
+				},
 			},
 		},
 	}
+	hydrateAuthRuntimeFromMetadata(auth, time.Now())
+	state := auth.ModelStates["grok-4"]
+	if state == nil {
+		t.Fatal("expected model state")
+	}
+	if state.FreeUsageExhaustionCount != 2 {
+		t.Fatalf("free usage hits = %d, want 2", state.FreeUsageExhaustionCount)
+	}
+	if !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected cooling state, got %+v", state)
+	}
+	if time.Until(state.NextRetryAfter) < time.Hour {
+		t.Fatalf("cooldown too short: %v", state.NextRetryAfter)
+	}
+
+	// Round-trip into metadata map.
+	syncAuthRuntimeMetadata(auth, time.Now())
+	runtime, ok := auth.Metadata["runtime"].(map[string]any)
+	if !ok {
+		t.Fatalf("runtime missing after sync: %#v", auth.Metadata["runtime"])
+	}
+	models, ok := runtime["models"].(map[string]any)
+	if !ok {
+		t.Fatalf("models missing: %#v", runtime)
+	}
+	entry, ok := models["grok-4"].(map[string]any)
+	if !ok {
+		t.Fatalf("model entry missing: %#v", models)
+	}
+	if entry["free_usage_hits"] != 2 {
+		t.Fatalf("free_usage_hits = %#v, want 2", entry["free_usage_hits"])
+	}
+	if _, ok := entry["cooldown_until"]; !ok {
+		t.Fatal("cooldown_until missing in runtime entry")
+	}
+}
+
+func TestRegisterHydratesRuntimeFromAuthMetadata(t *testing.T) {
+	until := time.Now().Add(3 * time.Hour).UTC()
 	manager := NewManager(nil, nil, nil)
-	manager.SetCooldownStateStore(store)
-	if _, err := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); err != nil {
+	auth := &Auth{
+		ID:       "auth-hydrate",
+		Provider: "xai",
+		Metadata: map[string]any{
+			"type": "xai",
+			"runtime": map[string]any{
+				"models": map[string]any{
+					"grok-4.5": map[string]any{
+						"cooldown_until": until.Format(time.RFC3339Nano),
+						"reason":         "quota",
+						"http_status":    429,
+					},
+				},
+			},
+		},
+	}
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := manager.RestoreCooldownStates(context.Background()); err != nil {
-		t.Fatalf("RestoreCooldownStates: %v", err)
-	}
-	auth, ok := manager.GetByID("auth-1")
+	got, ok := manager.GetByID("auth-hydrate")
 	if !ok {
 		t.Fatal("auth missing")
 	}
-	state := auth.ModelStates["grok-4"]
-	if state == nil || state.FreeUsageExhaustionCount != 2 {
-		t.Fatalf("restored free usage count = %+v, want 2", state)
+	state := got.ModelStates["grok-4.5"]
+	if state == nil || !state.Unavailable {
+		t.Fatalf("expected hydrated cooldown, state=%+v", state)
 	}
-	if state.Unavailable {
-		t.Fatal("counter-only restore must not mark model unavailable")
+	blocked, reason, next := isAuthBlockedForModel(got, "grok-4.5", time.Now())
+	if !blocked || reason != blockReasonCooldown || next.Before(time.Now()) {
+		t.Fatalf("blocked=%v reason=%v next=%v", blocked, reason, next)
 	}
 }

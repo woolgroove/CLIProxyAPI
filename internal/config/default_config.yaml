@@ -46,7 +46,6 @@ request-retry: 3
 max-retry-credentials: 0
 max-retry-interval: 30
 disable-cooling: false
-save-cooldown-status: true
 transient-error-cooldown-seconds: 0
 disable-claude-cloak-mode: false
 disable-image-generation: false

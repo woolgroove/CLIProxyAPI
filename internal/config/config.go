@@ -81,9 +81,6 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
-	// SaveCooldownStatus persists runtime cooldown status next to auth files when true.
-	// Default is true. Missing keys on upgrade are backfilled to true on disk.
-	SaveCooldownStatus bool `yaml:"save-cooldown-status" json:"save-cooldown-status"`
 
 	// TransientErrorCooldownSeconds controls cooldowns for transient upstream errors.
 	// 0 keeps the legacy default cooldown. Negative values disable these cooldowns.
@@ -299,10 +296,10 @@ type XAIConfig struct {
 	// Set to 0 to keep the model immediately eligible for a later request.
 	FreeUsageExhaustedCooldownHours *int `yaml:"free-usage-exhausted-cooldown-hours,omitempty" json:"free-usage-exhausted-cooldown-hours,omitempty"`
 	// FreeUsageExhaustedDisableAfter disables the auth file after this many free-usage
-	// exhaustion events (post-cooldown re-hits). Requires save-cooldown-status. 0 disables.
+	// exhaustion events (post-cooldown re-hits). Persisted in auth-file runtime. 0 disables.
 	FreeUsageExhaustedDisableAfter *int `yaml:"free-usage-exhausted-disable-after,omitempty" json:"free-usage-exhausted-disable-after,omitempty"`
 	// OtherForbiddenDisableAfter disables the auth file after this many other-403 events
-	// (post-cooldown re-hits). Requires save-cooldown-status. 0 disables.
+	// (post-cooldown re-hits). Persisted in auth-file runtime. 0 disables.
 	OtherForbiddenDisableAfter *int `yaml:"other-403-disable-after,omitempty" json:"other-403-disable-after,omitempty"`
 }
 
