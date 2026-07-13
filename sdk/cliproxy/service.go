@@ -767,7 +767,6 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	coreauth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 }
 
-
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
 		return "", "", false
@@ -2102,9 +2101,8 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 // one auth and reconciles any concurrent auth changes that race with the
 // refresh. Callers are expected to pre-filter provider membership.
 //
-// Re-registration is deliberate: registry cooldown/suspension state is treated
-// as part of the previous registration snapshot and is cleared when the auth is
-// rebound to the refreshed model catalog.
+// Re-registration refreshes model metadata while preserving any active runtime
+// cooldown/suspension for bindings that remain present.
 func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	return s.refreshModelRegistrationForAuthWithCache(current, nil)
 }

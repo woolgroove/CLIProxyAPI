@@ -189,6 +189,9 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 		eventData := xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):]))
 		eventData = restoreXAINamespaceToolCalls(eventData, prepared.namespaceTools)
+		if streamErr, ok := xaiTerminalStreamErr(eventData, e.cfg); ok {
+			return resp, streamErr
+		}
 		switch gjson.GetBytes(eventData, "type").String() {
 		case "response.output_item.done":
 			xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
@@ -674,6 +677,15 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				hasPendingEventLine := pendingEventLine != nil
 				for i, eventData := range eventDataList {
 					eventData = restoreXAINamespaceToolCalls(eventData, prepared.namespaceTools)
+					if streamErr, ok := xaiTerminalStreamErr(eventData, e.cfg); ok {
+						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+						reporter.PublishFailure(ctx, streamErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+						case <-ctx.Done():
+						}
+						return
+					}
 					normalizedEventName := gjson.GetBytes(eventData, "type").String()
 					switch normalizedEventName {
 					case "response.output_item.done":
@@ -728,6 +740,35 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func xaiTerminalStreamErr(eventData []byte, cfg *config.Config) (statusErr, bool) {
+	eventType := strings.TrimSpace(gjson.GetBytes(eventData, "type").String())
+	if eventType != "error" && eventType != "response.failed" {
+		return statusErr{}, false
+	}
+
+	statusCode := 0
+	for _, path := range []string{"status", "http_status", "error.status", "error.http_status", "response.error.status", "response.error.http_status"} {
+		if status := int(gjson.GetBytes(eventData, path).Int()); status >= 400 && status <= 599 {
+			statusCode = status
+			break
+		}
+	}
+	if statusCode == 0 {
+		lower := strings.ToLower(string(eventData))
+		switch {
+		case strings.Contains(lower, "free-usage-exhausted"), strings.Contains(lower, "included free usage"), strings.Contains(lower, "rate_limit"), strings.Contains(lower, "rate limit"):
+			statusCode = http.StatusTooManyRequests
+		case strings.Contains(lower, "permission-denied"), strings.Contains(lower, "permission denied"), strings.Contains(lower, "access denied"):
+			statusCode = http.StatusForbidden
+		case strings.Contains(lower, "authentication_error"), strings.Contains(lower, "invalid or expired token"), strings.Contains(lower, "unauthorized"):
+			statusCode = http.StatusUnauthorized
+		default:
+			statusCode = http.StatusBadRequest
+		}
+	}
+	return xaiStatusErr(statusCode, eventData, cfg), true
 }
 
 // CountTokens estimates token count for xAI Responses requests.

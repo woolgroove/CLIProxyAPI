@@ -160,10 +160,13 @@ func TestCodexTerminalStreamContextLengthErrIgnoresOtherTerminalErrors(t *testin
 	}
 }
 
-func TestCodexTerminalStreamErrIgnoresRateLimitTerminalErrors(t *testing.T) {
-	_, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`))
-	if ok {
-		t.Fatal("rate limit terminal error should not be handled by replay terminal error path")
+func TestCodexTerminalStreamErrHandlesRateLimitTerminalErrors(t *testing.T) {
+	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`))
+	if !ok {
+		t.Fatal("expected rate limit terminal error to be surfaced")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
 	}
 }
 

@@ -431,15 +431,10 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 				reg.InfoByProvider[provider] = cloneModelInfo(model)
 			}
 			reg.LastUpdated = now
-			// Re-registering an existing client/model binding starts a fresh registry
-			// snapshot for that binding. Cooldown and suspension are transient
-			// scheduling state and must not survive this reconciliation step.
-			if reg.QuotaExceededClients != nil {
-				delete(reg.QuotaExceededClients, clientID)
-			}
-			if reg.SuspendedClients != nil {
-				delete(reg.SuspendedClients, clientID)
-			}
+			// Preserve quota and suspension state for bindings that remain present.
+			// Re-registration refreshes model metadata; it is not evidence that an
+			// upstream cooldown has recovered. Removed bindings are cleared by the
+			// removal paths above.
 			if providerChanged && provider != "" {
 				if _, newlyAdded := addedSet[id]; newlyAdded {
 					continue

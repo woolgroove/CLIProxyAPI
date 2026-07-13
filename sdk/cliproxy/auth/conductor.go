@@ -219,12 +219,12 @@ func (NoopHook) OnResult(context.Context, Result) {}
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
 	store     Store
-	executors     map[string]ProviderExecutor
-	selector      Selector
-	hook          Hook
-	mu            sync.RWMutex
-	auths         map[string]*Auth
-	scheduler     *authScheduler
+	executors map[string]ProviderExecutor
+	selector  Selector
+	hook      Hook
+	mu        sync.RWMutex
+	auths     map[string]*Auth
+	scheduler *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -387,10 +387,9 @@ func (m *Manager) RefreshSchedulerAll() {
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
 // registry snapshot for one auth.
 //
-// Supported models are reset to a clean state because re-registration already
-// cleared the registry-side cooldown/suspension snapshot. ModelStates for
-// models that are no longer present in the registry are pruned entirely so
-// renamed/removed models cannot keep auth-level status stale.
+// Active runtime cooldowns and exhaustion counters remain authoritative across
+// model-catalog refreshes. ModelStates are pruned only when a non-empty registry
+// snapshot conclusively shows that a model was removed.
 func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
 		return
@@ -409,34 +408,39 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 		supported[modelKey] = struct{}{}
 	}
 
+	registryModelIDs := make(map[string]string, len(supportedModels))
+	for _, model := range supportedModels {
+		if model == nil {
+			continue
+		}
+		modelKey := canonicalModelKey(model.ID)
+		if modelKey != "" {
+			registryModelIDs[modelKey] = model.ID
+		}
+	}
+
 	var snapshot *Auth
+	changed := false
 	now := time.Now()
 
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
 	if ok && auth != nil && len(auth.ModelStates) > 0 {
-		changed := false
-		for modelKey, state := range auth.ModelStates {
+		for modelKey := range auth.ModelStates {
 			baseModel := canonicalModelKey(modelKey)
 			if baseModel == "" {
 				baseModel = strings.TrimSpace(modelKey)
 			}
-			if _, supportedModel := supported[baseModel]; !supportedModel {
+			if len(supported) > 0 {
+				if _, supportedModel := supported[baseModel]; supportedModel {
+					continue
+				}
 				// Drop state for models that disappeared from the current registry
 				// snapshot. Keeping them around leaks stale errors into auth-level
 				// status, management output, and websocket fallback checks.
 				delete(auth.ModelStates, modelKey)
 				changed = true
-				continue
 			}
-			if state == nil {
-				continue
-			}
-			if modelStateIsClean(state) {
-				continue
-			}
-			resetModelState(state, now)
-			changed = true
 		}
 		if len(auth.ModelStates) == 0 {
 			auth.ModelStates = nil
@@ -449,16 +453,41 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				auth.Status = StatusActive
 			}
 			auth.UpdatedAt = now
-			if errPersist := m.persist(ctx, auth); errPersist != nil {
-				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
-			}
-			snapshot = auth.Clone()
 		}
+		if auth.Metadata != nil {
+			syncAuthRuntimeMetadata(auth, now)
+		}
+		snapshot = auth.Clone()
 	}
 	m.mu.Unlock()
 
+	if snapshot != nil {
+		for modelKey, state := range snapshot.ModelStates {
+			if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(now) {
+				continue
+			}
+			baseModel := canonicalModelKey(modelKey)
+			registryModelID := registryModelIDs[baseModel]
+			if registryModelID == "" {
+				continue
+			}
+			if state.Quota.Exceeded {
+				registry.GetGlobalRegistry().SetModelQuotaExceeded(authID, registryModelID)
+			}
+			reason := strings.TrimSpace(state.Quota.Reason)
+			if reason == "" {
+				reason = strings.TrimSpace(state.StatusMessage)
+			}
+			registry.GetGlobalRegistry().SuspendClientModel(authID, registryModelID, reason)
+		}
+	}
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
+	}
+	if changed && snapshot != nil {
+		if errPersist := m.persist(ctx, snapshot); errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", snapshot.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+		}
 	}
 }
 
@@ -511,7 +540,6 @@ func (m *Manager) SetStore(store Store) {
 	defer m.mu.Unlock()
 	m.store = store
 }
-
 
 // SetRoundTripperProvider register a provider that returns a per-auth RoundTripper.
 func (m *Manager) SetRoundTripperProvider(p RoundTripperProvider) {
@@ -1929,6 +1957,11 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	now := time.Now()
+	// Watcher updates carry persisted runtime state in metadata. Hydrate it before
+	// merging with the current in-memory snapshot so a future cooldown cannot be
+	// dropped merely because the file was re-read.
+	hydrateAuthRuntimeFromMetadata(auth, now)
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
@@ -1943,30 +1976,71 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-			auth.ModelStates = existing.ModelStates
-		}
+		auth.ModelStates = mergeModelStatesConservatively(existing.ModelStates, auth.ModelStates, now)
 	}
-	now := time.Now()
-	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+		_ = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
+	if auth.Metadata != nil {
+		syncAuthRuntimeMetadata(auth, now)
+	}
 	authClone := auth.Clone()
+	persistSnapshot := authClone.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
-	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
-		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
-	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
+	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
-	m.hook.OnAuthUpdated(ctx, auth.Clone())
-	_ = clearedCooldown
-	return auth.Clone(), nil
+	if errPersist := m.persist(ctx, persistSnapshot); errPersist != nil {
+		logEntryWithRequestID(ctx).WithField("auth_id", authClone.ID).Warnf("failed to persist auth update: %v", errPersist)
+	}
+	m.hook.OnAuthUpdated(ctx, authClone.Clone())
+	return authClone.Clone(), nil
+}
+
+func mergeModelStatesConservatively(existing, incoming map[string]*ModelState, now time.Time) map[string]*ModelState {
+	if len(existing) == 0 && len(incoming) == 0 {
+		return nil
+	}
+	merged := make(map[string]*ModelState, len(existing)+len(incoming))
+	for model, state := range incoming {
+		merged[model] = state.Clone()
+	}
+	for model, existingState := range existing {
+		if existingState == nil {
+			continue
+		}
+		incomingState := merged[model]
+		if incomingState == nil {
+			merged[model] = existingState.Clone()
+			continue
+		}
+
+		existingCooling := existingState.Unavailable && !existingState.NextRetryAfter.IsZero() && existingState.NextRetryAfter.After(now)
+		incomingCooling := incomingState.Unavailable && !incomingState.NextRetryAfter.IsZero() && incomingState.NextRetryAfter.After(now)
+		if existingCooling && (!incomingCooling || existingState.NextRetryAfter.After(incomingState.NextRetryAfter)) {
+			incomingState = existingState.Clone()
+			merged[model] = incomingState
+		}
+		if existingState.FreeUsageExhaustionCount > incomingState.FreeUsageExhaustionCount {
+			incomingState.FreeUsageExhaustionCount = existingState.FreeUsageExhaustionCount
+		}
+		if existingState.OtherForbiddenCount > incomingState.OtherForbiddenCount {
+			incomingState.OtherForbiddenCount = existingState.OtherForbiddenCount
+		}
+		if existingState.UsageLimitCount > incomingState.UsageLimitCount {
+			incomingState.UsageLimitCount = existingState.UsageLimitCount
+		}
+		if existingState.AuthFailureCount > incomingState.AuthFailureCount {
+			incomingState.AuthFailureCount = existingState.AuthFailureCount
+		}
+	}
+	return merged
 }
 
 // Remove deletes an auth from runtime state without persisting.
@@ -3643,7 +3717,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
+		if auth.Metadata != nil {
+			syncAuthRuntimeMetadata(auth, now)
+		}
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
@@ -3661,6 +3737,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+	}
+	if authSnapshot != nil {
+		if errPersist := m.persist(ctx, authSnapshot); errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", authSnapshot.ID).Warnf("failed to persist auth result: %v", errPersist)
+		}
 	}
 
 	m.hook.OnResult(ctx, result)

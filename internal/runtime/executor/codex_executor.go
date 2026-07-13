@@ -135,23 +135,37 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 		return statusErr{}, nil, false
 	}
 	if len(body) == 0 {
-		return statusErr{}, nil, false
+		message := "upstream stream error"
+		if eventType == "response.failed" {
+			message = "upstream response failed"
+		}
+		body = []byte(`{"error":{}}`)
+		body, _ = sjson.SetBytes(body, "error.message", message)
 	}
-	if !codexTerminalStreamErrShouldHandle(body) {
-		return statusErr{}, nil, false
-	}
-	return newCodexStatusErr(http.StatusBadRequest, body), body, true
+	return newCodexStatusErr(codexTerminalStreamStatus(eventData, body), body), body, true
 }
 
-func codexTerminalStreamErrShouldHandle(body []byte) bool {
-	if codexTerminalErrorIsContextLength(body) {
-		return true
+func codexTerminalStreamStatus(eventData, body []byte) int {
+	for _, path := range []string{"status", "http_status", "error.status", "error.http_status", "response.error.status", "response.error.http_status"} {
+		if status := int(gjson.GetBytes(eventData, path).Int()); status >= 400 && status <= 599 {
+			return status
+		}
 	}
 	if isCodexUsageLimitError(body) || isCodexModelCapacityError(body) {
-		return true
+		return http.StatusTooManyRequests
 	}
-	code, _, ok := codexStatusErrorClassification(http.StatusBadRequest, body)
-	return ok && code == "thinking_signature_invalid"
+	lower := strings.ToLower(string(body))
+	if strings.Contains(lower, "rate_limit") || strings.Contains(lower, "rate limit") {
+		return http.StatusTooManyRequests
+	}
+	_, errType, classified := codexStatusErrorClassification(http.StatusBadRequest, body)
+	if classified && errType == "authentication_error" {
+		return http.StatusUnauthorized
+	}
+	if strings.Contains(lower, "payment_required") || strings.Contains(lower, "account_deactivated") || strings.Contains(lower, "account deactivated") {
+		return http.StatusPaymentRequired
+	}
+	return http.StatusBadRequest
 }
 
 func codexTerminalErrorBody(eventData []byte, path string) []byte {
