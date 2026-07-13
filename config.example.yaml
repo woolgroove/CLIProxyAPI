@@ -127,8 +127,9 @@ max-retry-interval: 30
 disable-cooling: false
 
 # When true, persist per-auth cooldown status as .cds files next to auth files.
-# Default is false; when false, cooldown status is kept in memory only.
-save-cooldown-status: false
+# Default is true. When false, cooldown status is kept in memory only.
+# On upgrade, any missing keys (including this one) are backfilled from built-in defaults.
+save-cooldown-status: true
 
 # Cooldown duration in seconds for transient upstream errors (408/500/502/503/504).
 # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
@@ -156,6 +157,11 @@ xai:
   other-403-cooldown-hours: 6
   # Model cooldown for subscription:free-usage-exhausted. Set 0 to keep the model immediately eligible.
   free-usage-exhausted-cooldown-hours: 24
+  # After this many free-usage exhaustion events (first hit + post-cooldown re-hits), disable the
+  # auth file. Requires save-cooldown-status (counters live in .cds). Set 0 to never auto-disable.
+  free-usage-exhausted-disable-after: 3
+  # Same repeated-exhaustion disable threshold for other (non permission-denied) xAI 403 responses.
+  other-403-disable-after: 3
 
 # Base model used by the legacy hosted image_generation tool path when a Codex image request is not proxied directly through the Image API.
 # Must start with "gpt-" (case-insensitive). If unset or invalid, defaults to "gpt-5.4-mini".

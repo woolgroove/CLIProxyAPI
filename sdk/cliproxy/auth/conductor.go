@@ -463,7 +463,6 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	}
 }
 
-
 // CodexInstructionMarkers returns configured private instruction model markers.
 func (m *Manager) CodexInstructionMarkers() codexinstructions.MarkerConfig {
 	if m == nil {
@@ -645,7 +644,12 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 
 func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now time.Time) bool {
 	authID := strings.TrimSpace(record.AuthID)
-	if authID == "" || record.NextRetryAfter.IsZero() || !record.NextRetryAfter.After(now) {
+	if authID == "" {
+		return false
+	}
+	cooling := !record.NextRetryAfter.IsZero() && record.NextRetryAfter.After(now)
+	hasCounters := record.FreeUsageExhaustionCount > 0 || record.OtherForbiddenCount > 0
+	if !cooling && !hasCounters {
 		return false
 	}
 	auth := m.auths[authID]
@@ -659,11 +663,14 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 	reason := strings.TrimSpace(record.Reason)
 	model := strings.TrimSpace(record.Model)
 	quota := record.Quota
-	if quota.Exceeded && quota.NextRecoverAt.IsZero() {
+	if cooling && quota.Exceeded && quota.NextRecoverAt.IsZero() {
 		quota.NextRecoverAt = record.NextRetryAfter
 	}
 
 	if model == "" {
+		if !cooling {
+			return false
+		}
 		auth.Unavailable = true
 		auth.Status = StatusError
 		auth.NextRetryAfter = record.NextRetryAfter
@@ -677,15 +684,23 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 	}
 
 	state := ensureModelState(auth, model)
-	state.Unavailable = true
-	state.Status = StatusError
-	state.NextRetryAfter = record.NextRetryAfter
-	state.Quota = quota
-	state.UpdatedAt = updatedAt
-	if reason != "" {
-		state.StatusMessage = reason
+	if cooling {
+		state.Unavailable = true
+		state.Status = StatusError
+		state.NextRetryAfter = record.NextRetryAfter
+		state.Quota = quota
+		if reason != "" {
+			state.StatusMessage = reason
+		}
+		state.LastError = cloneError(record.LastError)
 	}
-	state.LastError = cloneError(record.LastError)
+	if record.FreeUsageExhaustionCount > state.FreeUsageExhaustionCount {
+		state.FreeUsageExhaustionCount = record.FreeUsageExhaustionCount
+	}
+	if record.OtherForbiddenCount > state.OtherForbiddenCount {
+		state.OtherForbiddenCount = record.OtherForbiddenCount
+	}
+	state.UpdatedAt = updatedAt
 	updateAggregatedAvailability(auth, now)
 	return true
 }
@@ -914,6 +929,8 @@ func cooldownStateRecordEqual(a, b CooldownStateRecord) bool {
 		a.Model != b.Model ||
 		a.Status != b.Status ||
 		a.Reason != b.Reason ||
+		a.FreeUsageExhaustionCount != b.FreeUsageExhaustionCount ||
+		a.OtherForbiddenCount != b.OtherForbiddenCount ||
 		!a.NextRetryAfter.Equal(b.NextRetryAfter) ||
 		!a.UpdatedAt.Equal(b.UpdatedAt) ||
 		!cooldownQuotaEqual(a.Quota, b.Quota) {
@@ -958,20 +975,31 @@ func authCooldownStateRecord(auth *Auth, now time.Time) (CooldownStateRecord, bo
 
 func modelCooldownStateRecord(auth *Auth, model string, state *ModelState, now time.Time) (CooldownStateRecord, bool) {
 	model = strings.TrimSpace(model)
-	if auth == nil || state == nil || model == "" || !state.Unavailable || state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(now) {
+	if auth == nil || state == nil || model == "" {
 		return CooldownStateRecord{}, false
 	}
+	cooling := state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now)
+	hasCounters := state.FreeUsageExhaustionCount > 0 || state.OtherForbiddenCount > 0
+	if !cooling && !hasCounters {
+		return CooldownStateRecord{}, false
+	}
+	status := "tracked"
+	if cooling {
+		status = "cooling"
+	}
 	return CooldownStateRecord{
-		Provider:       strings.TrimSpace(auth.Provider),
-		AuthID:         auth.ID,
-		AuthFile:       cooldownAuthFile(auth),
-		Model:          model,
-		Status:         "cooling",
-		NextRetryAfter: state.NextRetryAfter,
-		Reason:         cooldownReason(state.StatusMessage, state.Quota, state.LastError),
-		Quota:          state.Quota,
-		LastError:      cloneError(state.LastError),
-		UpdatedAt:      state.UpdatedAt,
+		Provider:                 strings.TrimSpace(auth.Provider),
+		AuthID:                   auth.ID,
+		AuthFile:                 cooldownAuthFile(auth),
+		Model:                    model,
+		Status:                   status,
+		NextRetryAfter:           state.NextRetryAfter,
+		Reason:                   cooldownReason(state.StatusMessage, state.Quota, state.LastError),
+		Quota:                    state.Quota,
+		LastError:                cloneError(state.LastError),
+		FreeUsageExhaustionCount: state.FreeUsageExhaustionCount,
+		OtherForbiddenCount:      state.OtherForbiddenCount,
+		UpdatedAt:                state.UpdatedAt,
 	}, true
 }
 
@@ -3162,7 +3190,6 @@ func disallowFreeAuthFromMetadata(meta map[string]any) bool {
 	}
 }
 
-
 func privateInstructionsModeFromMetadata(meta map[string]any) bool {
 	return codexinstructions.RequestIsPrivate(meta)
 }
@@ -3787,7 +3814,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else if m.shouldAutoDisableXAIAuth(result) {
 			m.disableXAIAuthForPermissionFailure(auth, result.Error, now)
 		} else {
-			if result.Model != "" {
+			// Count free-usage / other-403 hits before applying cooldown so the first
+			// exhaustion also increments; subsequent hits only count after cooldown ends.
+			// A successful request after cooldown resets counters via resetModelState.
+			disabledByExhaustion := false
+			if kind := m.xaiExhaustionKindForResult(result); kind != "" {
+				disabledByExhaustion = m.trackXAIExhaustionCounter(auth, result, kind, now)
+			}
+			if disabledByExhaustion {
+				// Auth was disabled for repeated free-usage / other-403 exhaustion.
+			} else if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
 					disableCooling := m.cooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
@@ -3943,11 +3979,79 @@ func (m *Manager) shouldAutoDisableXAIAuth(result Result) bool {
 	if cfg == nil || !cfg.XAI.AutoDisablePermissionDeniedEnabled() {
 		return false
 	}
+	return isXAIPermissionDeniedError(result.Error)
+}
+
+func (m *Manager) disableXAIAuthForPermissionFailure(auth *Auth, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	reason := "xAI permission denied"
+	if resultErr != nil && strings.TrimSpace(resultErr.Message) != "" {
+		reason = resultErr.Message
+	}
+	m.disableXAIAuth(auth, reason, resultErr, now)
+}
+
+func (m *Manager) disableXAIAuth(auth *Auth, reason string, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "xAI auth disabled"
+	}
+	auth.Disabled = true
+	auth.Status = StatusDisabled
+	auth.StatusMessage = reason
+	auth.UpdatedAt = now
+	auth.LastError = cloneError(resultErr)
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = true
+	auth.Metadata["disabled_reason"] = reason
+}
+
+// xaiExhaustionKind identifies repeated xAI failures that can disable an auth after N hits.
+type xaiExhaustionKind string
+
+const (
+	xaiExhaustionFreeUsage      xaiExhaustionKind = "free_usage"
+	xaiExhaustionOtherForbidden xaiExhaustionKind = "other_403"
+)
+
+func (m *Manager) xaiExhaustionKindForResult(result Result) xaiExhaustionKind {
+	if m == nil || !strings.EqualFold(strings.TrimSpace(result.Provider), "xai") || result.Error == nil {
+		return ""
+	}
+	if isXAIFreeUsageExhaustedError(result.Error) {
+		return xaiExhaustionFreeUsage
+	}
+	if result.Error.HTTPStatus == http.StatusForbidden && !isXAIPermissionDeniedError(result.Error) {
+		return xaiExhaustionOtherForbidden
+	}
+	return ""
+}
+
+func isXAIFreeUsageExhaustedError(resultErr *Error) bool {
+	if resultErr == nil || resultErr.HTTPStatus != http.StatusTooManyRequests {
+		return false
+	}
+	body := strings.ToLower(resultErr.Message)
+	return strings.Contains(body, "free-usage-exhausted") ||
+		strings.Contains(body, "included free usage")
+}
+
+func isXAIPermissionDeniedError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
 	var payload struct {
 		Code  string          `json:"code"`
 		Error json.RawMessage `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(result.Error.Message), &payload); err != nil {
+	if err := json.Unmarshal([]byte(resultErr.Message), &payload); err != nil {
 		return false
 	}
 	if strings.EqualFold(strings.TrimSpace(payload.Code), "permission-denied") {
@@ -3968,24 +4072,61 @@ func (m *Manager) shouldAutoDisableXAIAuth(result Result) bool {
 		strings.EqualFold(strings.TrimSpace(nestedError.Message), "access denied.")
 }
 
-func (m *Manager) disableXAIAuthForPermissionFailure(auth *Auth, resultErr *Error, now time.Time) {
-	if auth == nil {
-		return
+// trackXAIExhaustionCounter increments post-cooldown exhaustion counters when .cds persistence
+// is enabled. Returns true when the auth was disabled after reaching the configured threshold.
+func (m *Manager) trackXAIExhaustionCounter(auth *Auth, result Result, kind xaiExhaustionKind, now time.Time) bool {
+	if m == nil || auth == nil || kind == "" || m.cooldownStore == nil || strings.TrimSpace(result.Model) == "" {
+		return false
 	}
-	reason := "xAI permission denied"
-	if resultErr != nil && strings.TrimSpace(resultErr.Message) != "" {
-		reason = resultErr.Message
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return false
 	}
-	auth.Disabled = true
-	auth.Status = StatusDisabled
-	auth.StatusMessage = reason
-	auth.UpdatedAt = now
-	auth.LastError = cloneError(resultErr)
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
+
+	threshold := 0
+	switch kind {
+	case xaiExhaustionFreeUsage:
+		threshold = cfg.XAI.FreeUsageExhaustedDisableAfterValue()
+	case xaiExhaustionOtherForbidden:
+		threshold = cfg.XAI.OtherForbiddenDisableAfterValue()
+	default:
+		return false
 	}
-	auth.Metadata["disabled"] = true
-	auth.Metadata["disabled_reason"] = reason
+	if threshold <= 0 {
+		return false
+	}
+
+	state := ensureModelState(auth, result.Model)
+	// Do not double-count while the model is still inside an active cooldown window.
+	if state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+		return false
+	}
+
+	switch kind {
+	case xaiExhaustionFreeUsage:
+		state.FreeUsageExhaustionCount++
+		if state.FreeUsageExhaustionCount >= threshold {
+			reason := fmt.Sprintf(
+				"xAI free usage always exhausted (counter=%d, threshold=%d)",
+				state.FreeUsageExhaustionCount,
+				threshold,
+			)
+			m.disableXAIAuth(auth, reason, result.Error, now)
+			return true
+		}
+	case xaiExhaustionOtherForbidden:
+		state.OtherForbiddenCount++
+		if state.OtherForbiddenCount >= threshold {
+			reason := fmt.Sprintf(
+				"xAI other 403 always exhausted (counter=%d, threshold=%d)",
+				state.OtherForbiddenCount,
+				threshold,
+			)
+			m.disableXAIAuth(auth, reason, result.Error, now)
+			return true
+		}
+	}
+	return false
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -4013,6 +4154,8 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.NextRetryAfter = time.Time{}
 	state.LastError = nil
 	state.Quota = QuotaState{}
+	state.FreeUsageExhaustionCount = 0
+	state.OtherForbiddenCount = 0
 	state.UpdatedAt = now
 }
 

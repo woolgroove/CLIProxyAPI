@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -76,5 +78,251 @@ func TestManagerMarkResult_KeepsUnknownXAI403Enabled(t *testing.T) {
 	}
 	if updated.Disabled {
 		t.Fatal("unknown xAI 403 must not disable the auth")
+	}
+}
+
+func freeUsageExhaustedResult(authID, model string, retryAfter time.Duration) Result {
+	result := Result{
+		AuthID:   authID,
+		Provider: "xai",
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for now."}`,
+		},
+	}
+	if retryAfter >= 0 {
+		result.RetryAfter = &retryAfter
+	}
+	return result
+}
+
+func otherForbiddenResult(authID, model string, retryAfter time.Duration) Result {
+	result := Result{
+		AuthID:   authID,
+		Provider: "xai",
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusForbidden,
+			Message:    `{"error":"temporary rejection"}`,
+		},
+	}
+	if retryAfter >= 0 {
+		result.RetryAfter = &retryAfter
+	}
+	return result
+}
+
+func TestManagerMarkResult_FreeUsageExhaustionDisablesAfterThreshold(t *testing.T) {
+	autoDisable := true
+	disableAfter := 3
+	freeCooldownHours := 24
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(&recordingCooldownStateStore{})
+	manager.SetConfig(&internalconfig.Config{
+		SaveCooldownStatus: true,
+		XAI: internalconfig.XAIConfig{
+			AutoDisablePermissionDenied:     &autoDisable,
+			FreeUsageExhaustedCooldownHours: &freeCooldownHours,
+			FreeUsageExhaustedDisableAfter:  &disableAfter,
+		},
+	})
+
+	auth := &Auth{ID: "xai-free-usage", Provider: "xai", Metadata: map[string]any{"type": "xai"}}
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	// Hit 1: count and cool down.
+	manager.MarkResult(context.Background(), freeUsageExhaustedResult(auth.ID, "grok-4.5", time.Hour))
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("auth missing after first free-usage hit")
+	}
+	if updated.Disabled {
+		t.Fatal("auth must stay enabled after first free-usage hit")
+	}
+	state := updated.ModelStates["grok-4.5"]
+	if state == nil || state.FreeUsageExhaustionCount != 1 {
+		t.Fatalf("free usage count after hit 1 = %+v, want 1", state)
+	}
+	if !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected cooldown after free-usage hit, state=%+v", state)
+	}
+
+	// Still in cooldown: do not double-count.
+	manager.MarkResult(context.Background(), freeUsageExhaustedResult(auth.ID, "grok-4.5", time.Hour))
+	updated, _ = manager.GetByID(auth.ID)
+	state = updated.ModelStates["grok-4.5"]
+	if state.FreeUsageExhaustionCount != 1 {
+		t.Fatalf("free usage count during cooldown = %d, want 1", state.FreeUsageExhaustionCount)
+	}
+
+	// Expire cooldown and hit again (count 2).
+	manager.mu.Lock()
+	manager.auths[auth.ID].ModelStates["grok-4.5"].NextRetryAfter = time.Now().Add(-time.Second)
+	manager.auths[auth.ID].ModelStates["grok-4.5"].Unavailable = false
+	manager.mu.Unlock()
+	manager.MarkResult(context.Background(), freeUsageExhaustedResult(auth.ID, "grok-4.5", time.Hour))
+	updated, _ = manager.GetByID(auth.ID)
+	if updated.Disabled {
+		t.Fatal("auth must stay enabled after second free-usage hit")
+	}
+	if got := updated.ModelStates["grok-4.5"].FreeUsageExhaustionCount; got != 2 {
+		t.Fatalf("free usage count after hit 2 = %d, want 2", got)
+	}
+
+	// Expire cooldown and hit threshold (count 3 → disable).
+	manager.mu.Lock()
+	manager.auths[auth.ID].ModelStates["grok-4.5"].NextRetryAfter = time.Now().Add(-time.Second)
+	manager.auths[auth.ID].ModelStates["grok-4.5"].Unavailable = false
+	manager.mu.Unlock()
+	manager.MarkResult(context.Background(), freeUsageExhaustedResult(auth.ID, "grok-4.5", time.Hour))
+	updated, _ = manager.GetByID(auth.ID)
+	if !updated.Disabled || updated.Status != StatusDisabled {
+		t.Fatalf("auth should be disabled after threshold, disabled=%t status=%s", updated.Disabled, updated.Status)
+	}
+	reason, _ := updated.Metadata["disabled_reason"].(string)
+	if !strings.Contains(reason, "always exhausted") || !strings.Contains(reason, "counter=3") {
+		t.Fatalf("disabled_reason = %q, want always exhausted with counter=3", reason)
+	}
+}
+
+func TestManagerMarkResult_FreeUsageSuccessResetsCounter(t *testing.T) {
+	disableAfter := 3
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(&recordingCooldownStateStore{})
+	manager.SetConfig(&internalconfig.Config{
+		SaveCooldownStatus: true,
+		XAI: internalconfig.XAIConfig{
+			FreeUsageExhaustedDisableAfter: &disableAfter,
+		},
+	})
+
+	auth := &Auth{ID: "xai-free-reset", Provider: "xai"}
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	manager.MarkResult(context.Background(), freeUsageExhaustedResult(auth.ID, "grok-4.5", time.Hour))
+	manager.mu.Lock()
+	manager.auths[auth.ID].ModelStates["grok-4.5"].NextRetryAfter = time.Now().Add(-time.Second)
+	manager.auths[auth.ID].ModelStates["grok-4.5"].Unavailable = false
+	manager.mu.Unlock()
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "xai",
+		Model:    "grok-4.5",
+		Success:  true,
+	})
+	updated, _ := manager.GetByID(auth.ID)
+	state := updated.ModelStates["grok-4.5"]
+	if state == nil || state.FreeUsageExhaustionCount != 0 {
+		t.Fatalf("expected free usage counter reset on success, state=%+v", state)
+	}
+}
+
+func TestManagerMarkResult_Other403ExhaustionDisablesAfterThreshold(t *testing.T) {
+	autoDisable := true
+	disableAfter := 2
+	otherCooldownHours := 6
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(&recordingCooldownStateStore{})
+	manager.SetConfig(&internalconfig.Config{
+		SaveCooldownStatus: true,
+		XAI: internalconfig.XAIConfig{
+			AutoDisablePermissionDenied: &autoDisable,
+			OtherForbiddenCooldownHours: &otherCooldownHours,
+			OtherForbiddenDisableAfter:  &disableAfter,
+		},
+	})
+
+	auth := &Auth{ID: "xai-other-403", Provider: "xai"}
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	manager.MarkResult(context.Background(), otherForbiddenResult(auth.ID, "grok-4.5", time.Hour))
+	updated, _ := manager.GetByID(auth.ID)
+	if updated.Disabled {
+		t.Fatal("auth must stay enabled after first other-403 hit")
+	}
+	if got := updated.ModelStates["grok-4.5"].OtherForbiddenCount; got != 1 {
+		t.Fatalf("other 403 count after hit 1 = %d, want 1", got)
+	}
+
+	manager.mu.Lock()
+	manager.auths[auth.ID].ModelStates["grok-4.5"].NextRetryAfter = time.Now().Add(-time.Second)
+	manager.auths[auth.ID].ModelStates["grok-4.5"].Unavailable = false
+	manager.mu.Unlock()
+	manager.MarkResult(context.Background(), otherForbiddenResult(auth.ID, "grok-4.5", time.Hour))
+	updated, _ = manager.GetByID(auth.ID)
+	if !updated.Disabled {
+		t.Fatal("auth should be disabled after other-403 threshold")
+	}
+	reason, _ := updated.Metadata["disabled_reason"].(string)
+	if !strings.Contains(reason, "other 403 always exhausted") || !strings.Contains(reason, "counter=2") {
+		t.Fatalf("disabled_reason = %q, want other 403 always exhausted with counter=2", reason)
+	}
+}
+
+func TestManagerMarkResult_ExhaustionCounterRequiresCooldownStore(t *testing.T) {
+	disableAfter := 1
+	manager := NewManager(nil, nil, nil)
+	// No cooldown store → counters must not run (requires save-cooldown-status / .cds).
+	manager.SetConfig(&internalconfig.Config{
+		XAI: internalconfig.XAIConfig{
+			FreeUsageExhaustedDisableAfter: &disableAfter,
+		},
+	})
+
+	auth := &Auth{ID: "xai-no-cds", Provider: "xai"}
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	manager.MarkResult(context.Background(), freeUsageExhaustedResult(auth.ID, "grok-4.5", time.Hour))
+	updated, _ := manager.GetByID(auth.ID)
+	if updated.Disabled {
+		t.Fatal("without cooldown store, free-usage must not disable auth via exhaustion counter")
+	}
+	state := updated.ModelStates["grok-4.5"]
+	if state != nil && state.FreeUsageExhaustionCount != 0 {
+		t.Fatalf("counter without store = %d, want 0", state.FreeUsageExhaustionCount)
+	}
+}
+
+func TestManager_RestoreCooldownStates_RestoresExhaustionCounters(t *testing.T) {
+	store := &recordingCooldownStateStore{
+		load: []CooldownStateRecord{
+			{
+				Provider:                 "xai",
+				AuthID:                   "auth-1",
+				Model:                    "grok-4",
+				Status:                   "tracked",
+				FreeUsageExhaustionCount: 2,
+				UpdatedAt:                time.Now().UTC(),
+			},
+		},
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if _, err := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := manager.RestoreCooldownStates(context.Background()); err != nil {
+		t.Fatalf("RestoreCooldownStates: %v", err)
+	}
+	auth, ok := manager.GetByID("auth-1")
+	if !ok {
+		t.Fatal("auth missing")
+	}
+	state := auth.ModelStates["grok-4"]
+	if state == nil || state.FreeUsageExhaustionCount != 2 {
+		t.Fatalf("restored free usage count = %+v, want 2", state)
+	}
+	if state.Unavailable {
+		t.Fatal("counter-only restore must not mark model unavailable")
 	}
 }

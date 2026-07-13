@@ -82,6 +82,7 @@ type Config struct {
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
 	// SaveCooldownStatus persists runtime cooldown status next to auth files when true.
+	// Default is true. Missing keys on upgrade are backfilled to true on disk.
 	SaveCooldownStatus bool `yaml:"save-cooldown-status" json:"save-cooldown-status"`
 
 	// TransientErrorCooldownSeconds controls cooldowns for transient upstream errors.
@@ -297,6 +298,12 @@ type XAIConfig struct {
 	// FreeUsageExhaustedCooldownHours is the model cooldown for xAI free-usage exhaustion.
 	// Set to 0 to keep the model immediately eligible for a later request.
 	FreeUsageExhaustedCooldownHours *int `yaml:"free-usage-exhausted-cooldown-hours,omitempty" json:"free-usage-exhausted-cooldown-hours,omitempty"`
+	// FreeUsageExhaustedDisableAfter disables the auth file after this many free-usage
+	// exhaustion events (post-cooldown re-hits). Requires save-cooldown-status. 0 disables.
+	FreeUsageExhaustedDisableAfter *int `yaml:"free-usage-exhausted-disable-after,omitempty" json:"free-usage-exhausted-disable-after,omitempty"`
+	// OtherForbiddenDisableAfter disables the auth file after this many other-403 events
+	// (post-cooldown re-hits). Requires save-cooldown-status. 0 disables.
+	OtherForbiddenDisableAfter *int `yaml:"other-403-disable-after,omitempty" json:"other-403-disable-after,omitempty"`
 }
 
 // DefaultXAIConfig returns the xAI failure policy used when the xai block is absent.
@@ -304,10 +311,14 @@ func DefaultXAIConfig() XAIConfig {
 	autoDisable := true
 	otherForbiddenCooldown := 6
 	freeUsageExhaustedCooldown := 24
+	freeUsageDisableAfter := 3
+	otherForbiddenDisableAfter := 3
 	return XAIConfig{
 		AutoDisablePermissionDenied:     &autoDisable,
 		OtherForbiddenCooldownHours:     &otherForbiddenCooldown,
 		FreeUsageExhaustedCooldownHours: &freeUsageExhaustedCooldown,
+		FreeUsageExhaustedDisableAfter:  &freeUsageDisableAfter,
+		OtherForbiddenDisableAfter:      &otherForbiddenDisableAfter,
 	}
 }
 
@@ -329,6 +340,18 @@ func NormalizeXAIConfig(value XAIConfig) XAIConfig {
 		zero := 0
 		value.FreeUsageExhaustedCooldownHours = &zero
 	}
+	if value.FreeUsageExhaustedDisableAfter == nil {
+		value.FreeUsageExhaustedDisableAfter = defaults.FreeUsageExhaustedDisableAfter
+	} else if *value.FreeUsageExhaustedDisableAfter < 0 {
+		zero := 0
+		value.FreeUsageExhaustedDisableAfter = &zero
+	}
+	if value.OtherForbiddenDisableAfter == nil {
+		value.OtherForbiddenDisableAfter = defaults.OtherForbiddenDisableAfter
+	} else if *value.OtherForbiddenDisableAfter < 0 {
+		zero := 0
+		value.OtherForbiddenDisableAfter = &zero
+	}
 	return value
 }
 
@@ -348,6 +371,18 @@ func (value XAIConfig) OtherForbiddenCooldownHoursValue() int {
 func (value XAIConfig) FreeUsageExhaustedCooldownHoursValue() int {
 	normalized := NormalizeXAIConfig(value)
 	return *normalized.FreeUsageExhaustedCooldownHours
+}
+
+// FreeUsageExhaustedDisableAfterValue returns how many free-usage re-hits disable the auth file.
+func (value XAIConfig) FreeUsageExhaustedDisableAfterValue() int {
+	normalized := NormalizeXAIConfig(value)
+	return *normalized.FreeUsageExhaustedDisableAfter
+}
+
+// OtherForbiddenDisableAfterValue returns how many other-403 re-hits disable the auth file.
+func (value XAIConfig) OtherForbiddenDisableAfterValue() int {
+	normalized := NormalizeXAIConfig(value)
+	return *normalized.OtherForbiddenDisableAfter
 }
 
 // CodexInstructionsConfig configures additional instructions injected into the
@@ -836,21 +871,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Unmarshal the YAML data into the Config struct.
 	var cfg Config
 	// Set defaults before unmarshal so that absent keys keep defaults.
-	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
-	cfg.LoggingToFile = false
-	cfg.LogsMaxTotalSizeMB = 0
-	cfg.ErrorLogsMaxFiles = 10
-	cfg.UsageStatisticsEnabled = false
-	cfg.RedisUsageQueueRetentionSeconds = 60
-	cfg.DisableCooling = false
-	cfg.SaveCooldownStatus = false
-	cfg.TransientErrorCooldownSeconds = 0
-	cfg.DisableImageGeneration = DisableImageGenerationOff
-	cfg.XAI = DefaultXAIConfig()
-	cfg.WebsocketAuth = true
-	cfg.Pprof.Enable = false
-	cfg.Pprof.Addr = DefaultPprofAddr
-	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	applyBuiltinPreUnmarshalDefaults(&cfg)
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -859,6 +880,27 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			return cfgOptional, nil
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// On normal (non-cloud-standby) loads, backfill any missing keys into the on-disk
+	// config file from the embedded defaults template, then re-parse so runtime matches file.
+	if !optional {
+		if changed, errEnsure := ensureMissingConfigKeysOnDisk(configFile, data); errEnsure != nil {
+			log.WithError(errEnsure).Warn("failed to backfill missing config keys")
+		} else if changed {
+			if refreshed, errRead := os.ReadFile(configFile); errRead != nil {
+				log.WithError(errRead).Warn("failed to re-read config after backfill")
+			} else {
+				var refreshedCfg Config
+				applyBuiltinPreUnmarshalDefaults(&refreshedCfg)
+				if errUnmarshal := yaml.Unmarshal(refreshed, &refreshedCfg); errUnmarshal != nil {
+					log.WithError(errUnmarshal).Warn("failed to re-parse config after backfill")
+				} else {
+					cfg = refreshedCfg
+					data = refreshed
+				}
+			}
+		}
 	}
 
 	// Hash remote management key if plaintext is detected (nested)

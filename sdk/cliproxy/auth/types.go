@@ -190,6 +190,10 @@ type ModelState struct {
 	LastError *Error `json:"last_error,omitempty"`
 	// Quota retains quota information if this model hit rate limits.
 	Quota QuotaState `json:"quota"`
+	// FreeUsageExhaustionCount tracks repeated xAI free-usage exhaustion hits (persisted via .cds).
+	FreeUsageExhaustionCount int `json:"free_usage_exhaustion_count,omitempty"`
+	// OtherForbiddenCount tracks repeated xAI other-403 hits (persisted via .cds).
+	OtherForbiddenCount int `json:"other_forbidden_count,omitempty"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
 }
