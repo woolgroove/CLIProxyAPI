@@ -171,7 +171,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, xaiStatusErr(httpResp.StatusCode, data)
+		return resp, xaiStatusErr(httpResp.StatusCode, data, e.cfg)
 	}
 
 	data, err := io.ReadAll(httpResp.Body)
@@ -266,7 +266,7 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = xaiStatusErr(httpResp.StatusCode, data)
+		err = xaiStatusErr(httpResp.StatusCode, data, e.cfg)
 		return nil, nil, nil, err
 	}
 
@@ -508,7 +508,7 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, xaiStatusErr(httpResp.StatusCode, data)
+		return resp, xaiStatusErr(httpResp.StatusCode, data, e.cfg)
 	}
 
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
@@ -574,7 +574,7 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, xaiStatusErr(httpResp.StatusCode, data)
+		return resp, xaiStatusErr(httpResp.StatusCode, data, e.cfg)
 	}
 
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
@@ -628,7 +628,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return nil, xaiStatusErr(httpResp.StatusCode, data)
+		return nil, xaiStatusErr(httpResp.StatusCode, data, e.cfg)
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -1723,17 +1723,10 @@ func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]by
 	return patched
 }
 
-// xaiFreeUsageExhaustedCooldown is the free-tier rolling window advertised by
-// cli-chat-proxy ("Usage resets over a rolling 24-hour window").
-const xaiFreeUsageExhaustedCooldown = 24 * time.Hour
-
-// xaiStatusErr wraps upstream error bodies so free-tier exhaustion
-// (subscription:free-usage-exhausted) carries a 24h RetryAfter hint for
-// auth cooldown / account rotation. Generic 429s stay without an explicit
-// retry hint so conductor backoff still applies.
-func xaiStatusErr(code int, body []byte) statusErr {
+// xaiStatusErr wraps upstream error bodies with configured xAI cooldown hints.
+func xaiStatusErr(code int, body []byte, cfg *config.Config) statusErr {
 	err := statusErr{code: code, msg: string(body)}
-	if code != http.StatusTooManyRequests || len(body) == 0 {
+	if len(body) == 0 {
 		return err
 	}
 	codeStr := strings.ToLower(gjson.GetBytes(body, "code").String())
@@ -1741,11 +1734,31 @@ func xaiStatusErr(code int, body []byte) statusErr {
 	if msg == "" {
 		msg = strings.ToLower(string(body))
 	}
-	if strings.Contains(codeStr, "free-usage-exhausted") ||
+	policy := config.DefaultXAIConfig()
+	if cfg != nil {
+		policy = config.NormalizeXAIConfig(cfg.XAI)
+	}
+	if code == http.StatusTooManyRequests && (strings.Contains(codeStr, "free-usage-exhausted") ||
 		strings.Contains(msg, "free-usage-exhausted") ||
-		strings.Contains(msg, "included free usage") {
-		d := xaiFreeUsageExhaustedCooldown
+		strings.Contains(msg, "included free usage")) {
+		d := time.Duration(policy.FreeUsageExhaustedCooldownHoursValue()) * time.Hour
+		err.retryAfter = &d
+	}
+	if code == http.StatusForbidden && (!policy.AutoDisablePermissionDeniedEnabled() || !xaiPermissionDeniedBody(body)) {
+		d := time.Duration(policy.OtherForbiddenCooldownHoursValue()) * time.Hour
 		err.retryAfter = &d
 	}
 	return err
+}
+
+func xaiPermissionDeniedBody(body []byte) bool {
+	code := strings.TrimSpace(gjson.GetBytes(body, "code").String())
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	}
+	message := strings.TrimSpace(gjson.GetBytes(body, "error").String())
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+	}
+	return strings.EqualFold(code, "permission-denied") || strings.EqualFold(message, "access denied.")
 }

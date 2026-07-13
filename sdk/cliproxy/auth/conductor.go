@@ -3772,6 +3772,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
+		} else if m.shouldAutoDisableXAIAuth(result) {
+			m.disableXAIAuthForPermissionFailure(auth, result.Error, now)
 		} else {
 			if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
@@ -3829,7 +3831,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								cooldown := 30 * time.Minute
+								if result.RetryAfter != nil && *result.RetryAfter >= 0 {
+									cooldown = *result.RetryAfter
+								}
+								next := now.Add(cooldown)
 								state.NextRetryAfter = next
 								suspendReason = "payment_required"
 								shouldSuspendModel = true
@@ -3915,6 +3921,59 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+func (m *Manager) shouldAutoDisableXAIAuth(result Result) bool {
+	if m == nil || !strings.EqualFold(strings.TrimSpace(result.Provider), "xai") || result.Error == nil || result.Error.HTTPStatus != http.StatusForbidden {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || !cfg.XAI.AutoDisablePermissionDeniedEnabled() {
+		return false
+	}
+	var payload struct {
+		Code  string          `json:"code"`
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(result.Error.Message), &payload); err != nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(payload.Code), "permission-denied") {
+		return true
+	}
+	var errorMessage string
+	if err := json.Unmarshal(payload.Error, &errorMessage); err == nil {
+		return strings.EqualFold(strings.TrimSpace(errorMessage), "access denied.")
+	}
+	var nestedError struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(payload.Error, &nestedError); err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(nestedError.Code), "permission-denied") ||
+		strings.EqualFold(strings.TrimSpace(nestedError.Message), "access denied.")
+}
+
+func (m *Manager) disableXAIAuthForPermissionFailure(auth *Auth, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	reason := "xAI permission denied"
+	if resultErr != nil && strings.TrimSpace(resultErr.Message) != "" {
+		reason = resultErr.Message
+	}
+	auth.Disabled = true
+	auth.Status = StatusDisabled
+	auth.StatusMessage = reason
+	auth.UpdatedAt = now
+	auth.LastError = cloneError(resultErr)
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = true
+	auth.Metadata["disabled_reason"] = reason
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

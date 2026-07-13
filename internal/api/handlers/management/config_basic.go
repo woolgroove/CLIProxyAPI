@@ -286,6 +286,20 @@ func (h *Handler) PutCodexInstructions(c *gin.Context) {
 	h.persist(c)
 }
 
+func (h *Handler) GetXAIConfig(c *gin.Context) {
+	c.JSON(http.StatusOK, config.NormalizeXAIConfig(h.cfg.XAI))
+}
+
+func (h *Handler) PutXAIConfig(c *gin.Context) {
+	var body config.XAIConfig
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body", "message": err.Error()})
+		return
+	}
+	h.cfg.XAI = config.NormalizeXAIConfig(body)
+	h.persist(c)
+}
+
 // Request retry
 func (h *Handler) GetRequestRetry(c *gin.Context) {
 	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})

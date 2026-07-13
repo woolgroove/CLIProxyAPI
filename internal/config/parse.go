@@ -28,6 +28,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SaveCooldownStatus = false
 	cfg.TransientErrorCooldownSeconds = 0
 	cfg.DisableImageGeneration = DisableImageGenerationOff
+	cfg.XAI = DefaultXAIConfig()
 	cfg.WebsocketAuth = true
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
@@ -74,6 +75,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+	cfg.XAI = NormalizeXAIConfig(cfg.XAI)
 
 	cfg.NormalizePluginsConfig()
 

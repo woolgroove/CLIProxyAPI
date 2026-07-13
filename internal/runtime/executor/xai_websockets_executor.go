@@ -474,7 +474,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			if sess != nil {
 				sess.reqMu.Unlock()
 			}
-			return nil, xaiStatusErr(respHS.StatusCode, bodyErr)
+			return nil, xaiStatusErr(respHS.StatusCode, bodyErr, e.cfg)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
@@ -507,7 +507,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				sess.clearActive(readCh)
 				sess.reqMu.Unlock()
 				if respHSRetry != nil && respHSRetry.StatusCode > 0 {
-					return nil, xaiStatusErr(respHSRetry.StatusCode, bodyErrRetry)
+					return nil, xaiStatusErr(respHSRetry.StatusCode, bodyErrRetry, e.cfg)
 				}
 				return nil, errDialRetry
 			}
@@ -624,7 +624,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			reporter.MarkFirstResponseByte()
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
-			if wsErr, ok := parseXAIWebsocketError(payload); ok {
+			if wsErr, ok := parseXAIWebsocketError(payload, e.cfg); ok {
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
@@ -820,10 +820,10 @@ func buildXAIWebsocketWarmupCompletedPayload(createdPayload []byte) []byte {
 	return completed
 }
 
-func parseXAIWebsocketError(payload []byte) (error, bool) {
+func parseXAIWebsocketError(payload []byte, cfg *config.Config) (error, bool) {
 	if wsErr, ok := parseCodexWebsocketError(payload); ok {
 		if statusError, okStatus := wsErr.(statusErrWithHeaders); okStatus {
-			xaiError := xaiStatusErr(statusError.code, payload)
+			xaiError := xaiStatusErr(statusError.code, payload, cfg)
 			if xaiError.retryAfter != nil {
 				statusError.retryAfter = xaiError.retryAfter
 			}
@@ -847,7 +847,7 @@ func parseXAIWebsocketError(payload []byte) (error, bool) {
 	if errNode := gjson.GetBytes(payload, "error"); errNode.Exists() {
 		out, _ = sjson.SetRawBytes(out, "error", []byte(errNode.Raw))
 	}
-	return xaiStatusErr(status, out), true
+	return xaiStatusErr(status, out, cfg), true
 }
 
 func xaiBareWebsocketErrorStatus(payload []byte) int {

@@ -349,6 +349,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
+		authManager.SetConfig(cfg)
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
 	managementasset.SetCurrentConfig(cfg)
@@ -889,6 +890,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/codex-instructions", s.mgmt.GetCodexInstructions)
 		mgmt.PUT("/codex-instructions", s.mgmt.PutCodexInstructions)
 		mgmt.PATCH("/codex-instructions", s.mgmt.PutCodexInstructions)
+		mgmt.GET("/xai-config", s.mgmt.GetXAIConfig)
+		mgmt.PUT("/xai-config", s.mgmt.PutXAIConfig)
+		mgmt.PATCH("/xai-config", s.mgmt.PutXAIConfig)
 
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
@@ -1838,6 +1842,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	applySignatureCacheConfig(oldCfg, cfg)
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
+		s.handlers.AuthManager.SetConfig(cfg)
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
 

@@ -564,6 +564,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	if reason := authDisabledReason(auth); reason != "" {
+		entry["disabled_reason"] = reason
+	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
@@ -603,6 +606,14 @@ func authAllowPrivateInstructionsValue(auth *coreauth.Auth) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func authDisabledReason(auth *coreauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	reason, _ := auth.Metadata["disabled_reason"].(string)
+	return strings.TrimSpace(reason)
 }
 
 func syncAuthFileAllowPrivateInstructionsAttribute(auth *coreauth.Auth) {
@@ -1483,6 +1494,9 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 		auth.Metadata = make(map[string]any)
 	}
 	auth.Metadata["disabled"] = disabled
+	if !disabled {
+		delete(auth.Metadata, "disabled_reason")
+	}
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.

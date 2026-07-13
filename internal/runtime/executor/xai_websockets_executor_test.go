@@ -764,7 +764,7 @@ func TestXAIWebsocketsExecuteStreamHandshakeFreeUsageExhaustedSetsRetryAfter(t *
 
 func TestParseXAIWebsocketErrorFreeUsageExhaustedSetsRetryAfter(t *testing.T) {
 	payload := []byte(`{"type":"error","status":429,"error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for now."}}`)
-	err, ok := parseXAIWebsocketError(payload)
+	err, ok := parseXAIWebsocketError(payload, nil)
 	if !ok {
 		t.Fatal("expected xAI websocket error")
 	}
@@ -787,7 +787,7 @@ func TestParseXAIWebsocketErrorFreeUsageExhaustedSetsRetryAfter(t *testing.T) {
 
 func TestParseXAIWebsocketBareErrorFreeUsageExhaustedSetsRetryAfter(t *testing.T) {
 	payload := []byte(`{"status":429,"error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for now."}}`)
-	err, ok := parseXAIWebsocketError(payload)
+	err, ok := parseXAIWebsocketError(payload, nil)
 	if !ok {
 		t.Fatal("expected bare xAI websocket error")
 	}

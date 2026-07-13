@@ -128,6 +128,9 @@ type Config struct {
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 
+	// XAI configures xAI/Grok-specific credential failure handling.
+	XAI XAIConfig `yaml:"xai" json:"xai"`
+
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
@@ -281,6 +284,70 @@ type CodexHeaderDefaults struct {
 type CodexConfig struct {
 	IdentityConfuse bool                    `yaml:"identity-confuse" json:"identity-confuse"`
 	Instructions    CodexInstructionsConfig `yaml:"instructions" json:"instructions"`
+}
+
+// XAIConfig configures xAI/Grok credential failure handling.
+type XAIConfig struct {
+	// AutoDisablePermissionDenied permanently disables an auth file when xAI returns
+	// a known permission-denied or access-denied response.
+	AutoDisablePermissionDenied *bool `yaml:"auto-disable-permission-denied,omitempty" json:"auto-disable-permission-denied,omitempty"`
+	// OtherForbiddenCooldownHours is the model cooldown for other xAI 403 responses.
+	// Set to 0 to keep the model immediately eligible for a later request.
+	OtherForbiddenCooldownHours *int `yaml:"other-403-cooldown-hours,omitempty" json:"other-403-cooldown-hours,omitempty"`
+	// FreeUsageExhaustedCooldownHours is the model cooldown for xAI free-usage exhaustion.
+	// Set to 0 to keep the model immediately eligible for a later request.
+	FreeUsageExhaustedCooldownHours *int `yaml:"free-usage-exhausted-cooldown-hours,omitempty" json:"free-usage-exhausted-cooldown-hours,omitempty"`
+}
+
+// DefaultXAIConfig returns the xAI failure policy used when the xai block is absent.
+func DefaultXAIConfig() XAIConfig {
+	autoDisable := true
+	otherForbiddenCooldown := 6
+	freeUsageExhaustedCooldown := 24
+	return XAIConfig{
+		AutoDisablePermissionDenied:     &autoDisable,
+		OtherForbiddenCooldownHours:     &otherForbiddenCooldown,
+		FreeUsageExhaustedCooldownHours: &freeUsageExhaustedCooldown,
+	}
+}
+
+// NormalizeXAIConfig fills omitted xAI policy values and clamps negative cooldowns.
+func NormalizeXAIConfig(value XAIConfig) XAIConfig {
+	defaults := DefaultXAIConfig()
+	if value.AutoDisablePermissionDenied == nil {
+		value.AutoDisablePermissionDenied = defaults.AutoDisablePermissionDenied
+	}
+	if value.OtherForbiddenCooldownHours == nil {
+		value.OtherForbiddenCooldownHours = defaults.OtherForbiddenCooldownHours
+	} else if *value.OtherForbiddenCooldownHours < 0 {
+		zero := 0
+		value.OtherForbiddenCooldownHours = &zero
+	}
+	if value.FreeUsageExhaustedCooldownHours == nil {
+		value.FreeUsageExhaustedCooldownHours = defaults.FreeUsageExhaustedCooldownHours
+	} else if *value.FreeUsageExhaustedCooldownHours < 0 {
+		zero := 0
+		value.FreeUsageExhaustedCooldownHours = &zero
+	}
+	return value
+}
+
+// AutoDisablePermissionDeniedEnabled reports whether known xAI permission failures disable auth files.
+func (value XAIConfig) AutoDisablePermissionDeniedEnabled() bool {
+	normalized := NormalizeXAIConfig(value)
+	return normalized.AutoDisablePermissionDenied != nil && *normalized.AutoDisablePermissionDenied
+}
+
+// OtherForbiddenCooldownHoursValue returns the configured xAI generic 403 cooldown.
+func (value XAIConfig) OtherForbiddenCooldownHoursValue() int {
+	normalized := NormalizeXAIConfig(value)
+	return *normalized.OtherForbiddenCooldownHours
+}
+
+// FreeUsageExhaustedCooldownHoursValue returns the configured xAI free-usage cooldown.
+func (value XAIConfig) FreeUsageExhaustedCooldownHoursValue() int {
+	normalized := NormalizeXAIConfig(value)
+	return *normalized.FreeUsageExhaustedCooldownHours
 }
 
 // CodexInstructionsConfig configures additional instructions injected into the
@@ -775,6 +842,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.SaveCooldownStatus = false
 	cfg.TransientErrorCooldownSeconds = 0
 	cfg.DisableImageGeneration = DisableImageGenerationOff
+	cfg.XAI = DefaultXAIConfig()
 	cfg.WebsocketAuth = true
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
@@ -831,6 +899,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+	cfg.XAI = NormalizeXAIConfig(cfg.XAI)
 
 	cfg.NormalizePluginsConfig()
 
