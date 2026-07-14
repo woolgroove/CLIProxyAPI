@@ -59,8 +59,12 @@ jobs:
           git log --reverse --pretty=format:'- %s (%h)' "$changelog_range" |
             grep -Ev '^- (docs:|test:)' > "$changelog_entries_file" || true
 
+          generate_notes_args=(-f tag_name="$GITHUB_REF_NAME")
+          if [[ -n "$previous_tag" ]]; then
+            generate_notes_args+=(-f previous_tag_name="$previous_tag")
+          fi
           gh api "repos/${GH_REPO}/releases/generate-notes" \
-            -f tag_name="$GITHUB_REF_NAME" \
+            "${generate_notes_args[@]}" \
             --jq .body > "$generated_notes_file"
           if [[ ! -s "$generated_notes_file" ]]; then
             if [[ -n "$previous_tag" ]]; then
@@ -659,6 +663,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          if [[ ! -d dist ]]; then
+            echo "No release artifact directory found"
+            exit 0
+          fi
           cd dist
           shopt -s nullglob
           archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
