@@ -8,8 +8,9 @@ if [ ! -f config.yaml ]; then
   cp config.example.yaml config.yaml
 fi
 
-# Render (and similar platforms) inject PORT; CLIProxyAPI only reads config.yaml.
-if [ -n "${PORT:-}" ]; then
+# Best-effort local file port patch. The binary also honors $PORT after config load
+# (needed when PGSTORE/GITSTORE/OBJECTSTORE supplies config.yaml).
+if [ -n "${PORT:-}" ] && [ -f config.yaml ]; then
   if grep -qE '^port:[[:space:]]*' config.yaml; then
     sed -i "s/^port:[[:space:]]*.*/port: ${PORT}/" config.yaml
   else

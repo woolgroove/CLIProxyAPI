@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -490,6 +491,12 @@ func main() {
 	}
 	if cfg == nil {
 		cfg = &config.Config{}
+	}
+	// Platforms like Render inject PORT; it must win over config.yaml / store defaults.
+	if portStr, ok := lookupEnv("PORT"); ok {
+		if port, errPort := strconv.Atoi(portStr); errPort == nil && port > 0 {
+			cfg.Port = port
+		}
 	}
 
 	// In cloud deploy mode, check if we have a valid configuration
